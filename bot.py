@@ -1,188 +1,190 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PulsePlay – Full Telegram Bot (buttons UI, markets, coinflip, manual signals, Solana deposits)
-- Inline-Menü mit Kontostand
-- Prediction Markets (YES/NO: +pct oder above:price), Auto-Lock/Settle
-- Coinflip (verdeckte Win-Rate 30%, Payout 2x), Einsatz-Buttons
-- Trader/Follower + manuelle Signale (MemeCoin, Futures, Lux) mit Wochenpreis
-- Solana-Deposit-Verifizierung (USDC/SOL) gegen zentrale Adresse
-- Admin-Panel als Buttons (kein /command nötig)
-Technik:
-  Python 3.10+ | pyTelegramBotAPI | SQLAlchemy 2 | APScheduler | requests
+PulsePlay – FULL single-file Telegram bot (buttons only)
+-------------------------------------------------------
+Features:
+  • Coinflip (hidden 30% win prob, x2 payout) via buttons
+  • Trader system: apply -> admin approve -> followers can subscribe (7-day access), 80/20 split
+  • Manual signals by approved traders (MemeCoin / Futures / Lux) to active followers
+  • Prediction markets (admin wizard with buttons, users bet YES/NO via buttons; auto-lock & settle)
+  • Wallet follow notifications (manual signals only; blockchain copy-trade can be added later)
+  • Balance with deposits (Solana USDC/SOL via RPC verification) & withdraw requests
 
-WICHTIG: Diese Datei nutzt fest eingetragene Defaults aus der Nutzer-Nachricht.
-Du kannst sie später via Umgebungsvariablen überschreiben:
-  ENV_BOT_TOKEN, ENV_ADMIN_IDS, ENV_CENTRAL_DEPOSIT_ADDRESS,
-  ENV_SOLANA_RPC_URL, ENV_DEFAULT_FEE_PCT, ENV_COINFLIP_PROB, ENV_COINFLIP_MULT
+Tech:
+  Python 3.10+
+  Libraries: pyTelegramBotAPI, SQLAlchemy (2.0.36+), requests, APScheduler
+
+ENV (create .env or set env vars before start):
+  ENV_BOT_TOKEN="8200746289:AAGbzwf7sUHVHlLDb3foXbZpj9SVGnqLeNU"
+  ENV_ADMIN_IDS="7919108078"
+  ENV_SOLANA_RPC_URL="https://api.mainnet-beta.solana.com"
+  ENV_CENTRAL_DEPOSIT_ADDRESS="CKZEpwiVqAHLiSbdc8Ebf8xaQ2fofgPCNmzi4cV32M1s"
+  ENV_DEFAULT_FEE_PCT="0.04"
+  ENV_PRICE_SOURCE="coingecko"
+  ENV_DEBUG="1"
 
 Start:
-  pip install -r requirements.txt
   python3 bot.py
 """
-import os, json, threading, random
+
+import os, json, threading, random, time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List
+from typing import Optional, Dict, List
 
 import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
-
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
-
 from sqlalchemy import (create_engine, Column, Integer, String, DateTime, Boolean,
                         ForeignKey, Float, Text, UniqueConstraint, Index)
 from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session, relationship
 
-# ========= CONFIG (mit Defaults aus der Nachricht) =========
+# ========= CONFIG =========
+def getenv_int_list(varname: str, default_csv: str) -> List[int]:
+    raw = os.getenv(varname, default_csv)
+    out = []
+    for x in raw.split(","):
+        x = x.strip()
+        if not x: continue
+        try:
+            out.append(int(x))
+        except: pass
+    return out
+
 BOT_TOKEN = os.getenv("ENV_BOT_TOKEN", "8200746289:AAGbzwf7sUHVHlLDb3foXbZpj9SVGnqLeNU")
-ADMIN_IDS = [int(x) for x in os.getenv("ENV_ADMIN_IDS", "7919108078").split(",") if x.strip()]
+ADMIN_IDS = getenv_int_list("ENV_ADMIN_IDS", "7919108078")
 CENTRAL_DEPOSIT_ADDRESS = os.getenv("ENV_CENTRAL_DEPOSIT_ADDRESS", "CKZEpwiVqAHLiSbdc8Ebf8xaQ2fofgPCNmzi4cV32M1s")
 SOLANA_RPC_URL = os.getenv("ENV_SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 USDC_SOLANA_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
 DEFAULT_FEE_PCT = float(os.getenv("ENV_DEFAULT_FEE_PCT", "0.04"))  # 4%
-COINFLIP_WIN_PROB = float(os.getenv("ENV_COINFLIP_PROB", "0.30"))  # 30% Win (geheim)
-COINFLIP_PAYOUT_MULT = float(os.getenv("ENV_COINFLIP_MULT", "2.0"))  # 2x Auszahlung bei Win
+COINFLIP_WIN_PROB = float(os.getenv("ENV_COINFLIP_PROB", "0.30"))  # 30% win probability (hidden)
+COINFLIP_PAYOUT_MULT = float(os.getenv("ENV_COINFLIP_MULT", "2.0"))  # x2 payout on win
 DEBUG = os.getenv("ENV_DEBUG", "1") == "1"
+PRICE_SOURCE = os.getenv("ENV_PRICE_SOURCE", "coingecko")
 
-# ========= Utils =========
-def esc(text: str) -> str:
-    return (text or "").replace("<", "&lt;").replace(">", "&gt;")
-
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
-
-def dbg(msg: str):
-    if DEBUG:
-        print(f"[{datetime.utcnow().isoformat()}] {msg}")
-
-def is_admin(tg_id: int) -> bool:
-    return tg_id in ADMIN_IDS
-
-# ========= Bot & DB =========
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 Base = declarative_base()
 engine = create_engine("sqlite:///pulseplay_full.db", connect_args={"check_same_thread": False})
 SessionLocal = scoped_session(sessionmaker(bind=engine, autocommit=False, autoflush=False))
 
-# ========= Datenbank-Modelle =========
+def now_utc():
+    return datetime.now(timezone.utc)
+
+def esc(s: str) -> str:
+    return s.replace("<", "&lt;").replace(">", "&gt;")
+
+def dbg(msg: str):
+    if DEBUG:
+        print(f"[{datetime.utcnow().isoformat()}] {msg}")
+
+# ========= MODELS =========
 class User(Base):
     __tablename__ = "users"
     id = Column(Integer, primary_key=True)
     telegram_id = Column(String, unique=True, index=True)
     username = Column(String, default="")
-    role = Column(String, default="user")  # user, trader, admin
-    created_at = Column(DateTime(timezone=True), default=now_utc)
+    role = Column(String, default="user")  # user/trader/admin
+    created_at = Column(DateTime, default=lambda: datetime.utcnow())
 
 class Balance(Base):
     __tablename__ = "balances"
     id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
     currency = Column(String, default="USDC")
     amount = Column(Float, default=0.0)
+
+class Trader(Base):
+    __tablename__ = "traders"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), unique=True)
+    approved = Column(Boolean, default=False)
+    profile = Column(Text, default="")  # short bio
+    weekly_price = Column(Float, default=20.0)  # USDC/week
+
+class Follow(Base):
+    __tablename__ = "follows"
+    id = Column(Integer, primary_key=True)
+    follower_user_id = Column(Integer, ForeignKey("users.id"), index=True)
+    trader_id = Column(Integer, ForeignKey("traders.id"), index=True)
+    started_at = Column(DateTime, default=lambda: datetime.utcnow())
+    expires_at = Column(DateTime)  # 7 days from start
+    __table_args__ = (UniqueConstraint("follower_user_id", "trader_id", name="uq_follow_once"),)
+
+class Payment(Base):
+    __tablename__ = "payments"
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"))
+    type = Column(String)  # deposit/withdraw/subscription
+    method = Column(String, default="solana")
+    amount = Column(Float, default=0.0)
+    tx = Column(String, default="")
+    status = Column(String, default="pending")
+    created_at = Column(DateTime, default=lambda: datetime.utcnow())
+    meta = Column(Text, default="{}")
 
 class Market(Base):
     __tablename__ = "markets"
     id = Column(Integer, primary_key=True)
     symbol = Column(String)
-    timeframe = Column(String)  # 1h,4h,24h
-    condition = Column(String)  # +2% | above:123.45
-    start_at = Column(DateTime(timezone=True))
-    lock_at = Column(DateTime(timezone=True))
-    settle_at = Column(DateTime(timezone=True))
-    status = Column(String, default="open")  # open, locked, settled, canceled
+    condition = Column(String)  # "+2%" or "above:150.0"
+    timeframe = Column(String)  # "1h","4h","24h"
+    status = Column(String, default="open")  # open/locked/settled/canceled
+    start_at = Column(DateTime)
+    lock_at = Column(DateTime)
+    settle_at = Column(DateTime)
     reference_price = Column(Float, default=0.0)
     settle_price = Column(Float, default=0.0)
-    oracle_source = Column(String, default="coingecko")
 
 class Bet(Base):
     __tablename__ = "bets"
     id = Column(Integer, primary_key=True)
-    market_id = Column(Integer, ForeignKey("markets.id"), index=True)
-    user_id = Column(Integer, ForeignKey("users.id"), index=True)
-    side = Column(String)  # YES, NO
+    market_id = Column(Integer, ForeignKey("markets.id"))
+    user_id = Column(Integer, ForeignKey("users.id"))
+    side = Column(String)  # YES/NO
     stake = Column(Float, default=0.0)
     fee = Column(Float, default=0.0)
     payout = Column(Float, default=0.0)
-    placed_at = Column(DateTime(timezone=True), default=now_utc)
     settled = Column(Boolean, default=False)
-
-class Payment(Base):
-    __tablename__ = "payments"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), index=True)
-    type = Column(String)  # deposit, withdraw
-    method = Column(String, default="solana")
-    amount = Column(Float, default=0.0)
-    tx = Column(String, default="")  # signature
-    status = Column(String, default="pending")
-    created_at = Column(DateTime(timezone=True), default=now_utc)
-    meta = Column(Text, default="{}")  # sender/dest
-
-class Trader(Base):
-    __tablename__ = "traders"
-    id = Column(Integer, primary_key=True)
-    user_id = Column(Integer, ForeignKey("users.id"), unique=True, index=True)
-    is_approved = Column(Boolean, default=False)
-    weekly_price_usdc = Column(Float, default=19.0)
-
-class Follow(Base):
-    __tablename__ = "follows"
-    id = Column(Integer, primary_key=True)
-    follower_id = Column(Integer, ForeignKey("users.id"), index=True)
-    trader_id = Column(Integer, ForeignKey("traders.id"), index=True)
-    started_at = Column(DateTime(timezone=True), default=now_utc)
-    __table_args__ = (UniqueConstraint("follower_id", "trader_id", name="uq_follow"),)
-
-class ManualSignal(Base):
-    __tablename__ = "manual_signals"
-    id = Column(Integer, primary_key=True)
-    trader_id = Column(Integer, ForeignKey("traders.id"), index=True)
-    category = Column(String)  # memecoin, futures, lux
-    text = Column(Text)
-    created_at = Column(DateTime(timezone=True), default=now_utc)
+    placed_at = Column(DateTime, default=lambda: datetime.utcnow())
 
 Base.metadata.create_all(bind=engine)
 
-# ========= DB-Helper =========
-def get_session():
+# ========= HELPERS =========
+def db_sess():
     return SessionLocal()
 
-def ensure_user(message: Message) -> User:
-    db = get_session()
+def get_or_create_user(message: Message) -> User:
+    db = db_sess()
     try:
         tid = str(message.from_user.id)
         u = db.query(User).filter(User.telegram_id == tid).first()
         if not u:
-            role = "admin" if is_admin(message.from_user.id) else "user"
+            role = "admin" if message.from_user.id in ADMIN_IDS else "user"
             u = User(telegram_id=tid, username=message.from_user.username or "", role=role)
             db.add(u); db.commit()
+            if role == "admin":
+                # also ensure Trader row (not approved by default)
+                tr = db.query(Trader).filter(Trader.user_id==u.id).first()
+                if not tr:
+                    tr = Trader(user_id=u.id, approved=True, profile="Admin Trader", weekly_price=20.0)
+                    db.add(tr); db.commit()
         return u
     finally:
         db.close()
 
-def ensure_user_by_id(tg_id: int, username: str = "") -> User:
-    db = get_session()
-    try:
-        tid = str(tg_id)
-        u = db.query(User).filter(User.telegram_id == tid).first()
-        if not u:
-            role = "admin" if is_admin(tg_id) else "user"
-            u = User(telegram_id=tid, username=username, role=role)
-            db.add(u); db.commit()
-        return u
-    finally:
-        db.close()
+def is_admin(user_id: int) -> bool:
+    return user_id in ADMIN_IDS
 
-def get_balance(db, user_id: int, currency: str = "USDC") -> float:
-    b = db.query(Balance).filter(Balance.user_id == user_id, Balance.currency == currency).first()
+def get_balance(db, user_id: int, currency="USDC") -> float:
+    b = db.query(Balance).filter(Balance.user_id==user_id, Balance.currency==currency).first()
     return b.amount if b else 0.0
 
 def upsert_balance(db, user_id: int, currency: str, delta: float) -> float:
-    b = db.query(Balance).filter(Balance.user_id == user_id, Balance.currency == currency).first()
+    b = db.query(Balance).filter(Balance.user_id==user_id, Balance.currency==currency).first()
     if not b:
         b = Balance(user_id=user_id, currency=currency, amount=0.0)
         db.add(b); db.flush()
@@ -190,13 +192,12 @@ def upsert_balance(db, user_id: int, currency: str, delta: float) -> float:
     db.commit()
     return b.amount
 
-# ========= Preise =========
+# ========= PRICES =========
 def coingecko_price(symbol: str) -> Optional[float]:
-    aliases = {"SOL": "solana", "USDC": "usd-coin", "PEPE": "pepe", "BONK": "bonk", "DOGE": "dogecoin", "SHIB": "shiba-inu", "WIF": "dogwifcoin"}
+    aliases = {"SOL":"solana","USDC":"usd-coin","PEPE":"pepe","BONK":"bonk","BTC":"bitcoin","ETH":"ethereum","LUX":"lux-btc"}
     cid = aliases.get(symbol.upper(), symbol.lower())
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={cid}&vs_currencies=usd"
     try:
-        r = requests.get(url, timeout=10)
+        r = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={cid}&vs_currencies=usd", timeout=12)
         if r.status_code == 200:
             return float(r.json()[cid]["usd"])
     except Exception as e:
@@ -206,7 +207,7 @@ def coingecko_price(symbol: str) -> Optional[float]:
 def get_price(symbol: str) -> Optional[float]:
     return coingecko_price(symbol)
 
-# ========= Solana RPC =========
+# ========= SOLANA RPC =========
 def sol_rpc(method: str, params: list):
     payload = {"jsonrpc":"2.0","id":1,"method":method,"params":params}
     r = requests.post(SOLANA_RPC_URL, json=payload, timeout=20)
@@ -216,10 +217,10 @@ def sol_rpc(method: str, params: list):
         raise RuntimeError(j["error"])
     return j["result"]
 
-def get_sigs_for_address(address: str, limit: int = 30):
+def get_sigs_for_address(address: str, limit=40):
     return sol_rpc("getSignaturesForAddress", [address, {"limit": limit}])
 
-def get_tx(sig: str) -> dict:
+def get_tx(sig: str):
     return sol_rpc("getTransaction", [sig, {"encoding":"json","maxSupportedTransactionVersion":0}])
 
 def parse_token_transfers(tx_json: dict) -> List[dict]:
@@ -228,795 +229,655 @@ def parse_token_transfers(tx_json: dict) -> List[dict]:
         meta = tx_json.get("meta",{})
         pre_bal = meta.get("preBalances",[])
         post_bal = meta.get("postBalances",[])
-        if pre_bal and post_bal:
-            for idx,(pre,post) in enumerate(zip(pre_bal, post_bal)):
-                diff = (post - pre) / 1e9
-                if abs(diff) > 0:
-                    out.append({"account_index":idx,"mint":"SOL","amount":diff})
+        for pre, post in zip(pre_bal, post_bal):
+            diff = (post-pre)/1e9
+            if abs(diff)>0: out.append({"mint":"SOL","amount":diff})
         pre_token = {tb["accountIndex"]:float(tb["uiTokenAmount"]["uiAmount"] or 0.0) for tb in meta.get("preTokenBalances",[])}
         for tb in meta.get("postTokenBalances",[]):
             idx = tb["accountIndex"]
-            pre = pre_token.get(idx, 0.0)
-            post = float(tb["uiTokenAmount"]["uiAmount"] or 0.0)
-            mint = tb["mint"]
-            diff = post - pre
-            if abs(diff) > 0:
-                out.append({"account_index":idx,"mint":mint,"amount":diff})
+            pre = pre_token.get(idx,0.0); post = float(tb["uiTokenAmount"]["uiAmount"] or 0.0)
+            out.append({"mint":tb["mint"],"amount":(post-pre)})
     except Exception as e:
-        dbg(f"parse_token_transfers error: {e}")
+        dbg(f"parse_token_transfers err {e}")
     return out
 
-def get_account_keys(tx_json:dict)->List[str]:
-    accs = tx_json.get("transaction",{}).get("message",{}).get("accountKeys",[])
-    keys = []
-    for a in accs:
-        if isinstance(a, dict):
-            keys.append(a.get("pubkey"))
-        else:
-            keys.append(a)
-    return [k for k in keys if k]
-
-# ========= Scheduler-Jobs =========
-def settle_markets_job():
-    db = get_session()
-    try:
-        now = now_utc()
-        # lock
-        to_lock = db.query(Market).filter(Market.status=="open", Market.lock_at <= now).all()
-        for m in to_lock:
-            m.status = "locked"; db.commit()
-        # settle
-        to_settle = db.query(Market).filter(Market.status=="locked", Market.settle_at <= now).all()
-        for m in to_settle:
-            p = get_price(m.symbol) or 0.0
-            m.settle_price = p
-            win_yes = False
-            cond = m.condition.strip()
-            if cond.endswith("%"):
-                try:
-                    pct = float(cond.strip("%").strip())
-                    if m.reference_price>0:
-                        change = ((p - m.reference_price)/m.reference_price)*100.0
-                        win_yes = change >= pct
-                except: pass
-            elif cond.startswith("above:"):
-                try:
-                    thr = float(cond.split(":",1)[1])
-                    win_yes = p >= thr
-                except: pass
-            yes_bets = db.query(Bet).filter(Bet.market_id==m.id, Bet.side=="YES").all()
-            no_bets  = db.query(Bet).filter(Bet.market_id==m.id, Bet.side=="NO").all()
-            pool_yes = sum(b.stake for b in yes_bets)
-            pool_no  = sum(b.stake for b in no_bets)
-            winners = yes_bets if win_yes else no_bets
-            losers_pool = pool_no if win_yes else pool_yes
-            winners_pool = pool_yes if win_yes else pool_no
-            gross_pool = winners_pool + losers_pool
-            house_fee = losers_pool * DEFAULT_FEE_PCT
-            distributable = gross_pool - house_fee
-            if winners:
-                ssum = sum(b.stake for b in winners)
-                for b in winners:
-                    share = (b.stake/ssum) if ssum>0 else 0
-                    payout = round(distributable*share, 6)
-                    b.payout = payout; b.settled = True
-                    upsert_balance(db, b.user_id, "USDC", payout)
-            for b in (yes_bets + no_bets):
-                if not b.settled:
-                    b.payout = 0.0; b.settled = True
-            m.status = "settled"; db.commit()
-    finally:
-        db.close()
-
+# ========= SCHEDULER =========
 scheduler = BackgroundScheduler(timezone="UTC")
-scheduler.add_job(settle_markets_job, IntervalTrigger(seconds=20), id="settle_markets", max_instances=1, coalesce=True)
+SCHED_LOCK = threading.Lock()
+
+def check_market_lifecycle():
+    with SCHED_LOCK:
+        db = db_sess()
+        try:
+            now = now_utc()
+            # lock
+            to_lock = db.query(Market).filter(Market.status=="open", Market.lock_at<=now).all()
+            for m in to_lock:
+                m.status = "locked"
+                db.commit()
+            # settle
+            to_settle = db.query(Market).filter(Market.status=="locked", Market.settle_at<=now).all()
+            for m in to_settle:
+                sp = get_price(m.symbol) or 0.0
+                m.settle_price = sp
+                # evaluate
+                win_yes = False
+                cond = m.condition.strip()
+                if cond.endswith("%"):
+                    try:
+                        pct = float(cond.replace("%","").replace("+","").strip())
+                        if m.reference_price>0:
+                            chg = (sp - m.reference_price)/m.reference_price*100.0
+                            win_yes = chg >= pct
+                    except: pass
+                elif cond.startswith("above:"):
+                    try:
+                        thr = float(cond.split(":",1)[1])
+                        win_yes = sp >= thr
+                    except: pass
+                yes_bets = db.query(Bet).filter(Bet.market_id==m.id, Bet.side=="YES").all()
+                no_bets = db.query(Bet).filter(Bet.market_id==m.id, Bet.side=="NO").all()
+                pool_yes = sum(b.stake for b in yes_bets)
+                pool_no = sum(b.stake for b in no_bets)
+                winners = yes_bets if win_yes else no_bets
+                losers_pool = pool_no if win_yes else pool_yes
+                winners_pool = pool_yes if win_yes else pool_no
+                fee = losers_pool*DEFAULT_FEE_PCT
+                distributable = winners_pool + losers_pool - fee
+                if winners:
+                    ssum = sum(b.stake for b in winners)
+                    for b in winners:
+                        share = (b.stake/ssum) if ssum>0 else 0
+                        pay = round(distributable*share,6)
+                        b.payout = pay; b.settled=True
+                        upsert_balance(db, b.user_id, "USDC", pay)
+                for b in yes_bets+no_bets:
+                    if not b.settled:
+                        b.settled=True; b.payout=0.0
+                m.status = "settled"
+                db.commit()
+        finally:
+            db.close()
+
+scheduler.add_job(check_market_lifecycle, IntervalTrigger(seconds=20), max_instances=1, coalesce=True)
 scheduler.start()
 
-# ========= Keyboards =========
-def main_menu_kbd(u: User, db) -> InlineKeyboardMarkup:
+# ========= UI BUILDERS =========
+def kb_main(u: User, db) -> InlineKeyboardMarkup:
     usdc = get_balance(db, u.id, "USDC")
-    k = InlineKeyboardMarkup(row_width=2)
-    k.add(
-        InlineKeyboardButton(f"📊 Märkte", callback_data="menu:markets"),
-        InlineKeyboardButton(f"🪙 Coinflip", callback_data="menu:coinflip"),
-    )
-    k.add(
-        InlineKeyboardButton(f"💬 Signale", callback_data="menu:signals"),
-        InlineKeyboardButton(f"💰 Einzahlen/Auszahlen", callback_data="menu:wallet"),
-    )
-    if is_admin(int(u.telegram_id)):
-        k.add(InlineKeyboardButton("🛠️ Admin", callback_data="menu:admin"))
-    k.add(InlineKeyboardButton(f"ℹ️ Hilfe", callback_data="menu:help"))
-    return k
-
-def markets_kbd(m: Market, is_open: bool) -> InlineKeyboardMarkup:
+    sol  = get_balance(db, u.id, "SOL")
     k = InlineKeyboardMarkup()
-    if is_open:
-        k.add(InlineKeyboardButton("✅ YES setzen", callback_data=f"bet:{m.id}:YES"),
-              InlineKeyboardButton("❌ NO setzen",  callback_data=f"bet:{m.id}:NO"))
-    k.add(InlineKeyboardButton("🔙 Zurück", callback_data="menu:markets"))
+    k.row(InlineKeyboardButton(f"💰 Balance: USDC {usdc:.2f}", callback_data="nav:balance"),
+          InlineKeyboardButton("🎮 Coinflip", callback_data="nav:coinflip"))
+    k.row(InlineKeyboardButton("📣 Trader", callback_data="nav:traders"),
+          InlineKeyboardButton("📊 Markets", callback_data="nav:markets"))
+    if u.role=="admin":
+        k.row(InlineKeyboardButton("🛠 Admin-Panel", callback_data="nav:admin"))
+    k.row(InlineKeyboardButton("ℹ️ Hilfe", callback_data="nav:help"))
     return k
 
-def coinflip_menu_kbd() -> InlineKeyboardMarkup:
-    k = InlineKeyboardMarkup(row_width=2)
-    k.add(
-        InlineKeyboardButton("Kopf", callback_data="cf:HEADS"),
-        InlineKeyboardButton("Zahl", callback_data="cf:TAILS"),
-    )
-    for amt in [1,5,10,25,50]:
-        k.add(InlineKeyboardButton(f"{amt} USDC", callback_data=f"cfamt:{amt}"))
-    k.add(InlineKeyboardButton("🔙 Zurück", callback_data="menu:main"))
+def kb_coinflip() -> InlineKeyboardMarkup:
+    k = InlineKeyboardMarkup()
+    for a in [1,5,10,25,50]:
+        k.row(InlineKeyboardButton(f"🪙 Kopf {a}", callback_data=f"cf:K:{a}"),
+              InlineKeyboardButton(f"🪙 Zahl {a}", callback_data=f"cf:Z:{a}"))
+    k.row(InlineKeyboardButton("ALL-IN Kopf", callback_data="cf:K:ALL"),
+          InlineKeyboardButton("ALL-IN Zahl", callback_data="cf:Z:ALL"))
+    k.row(InlineKeyboardButton("⬅️ Zurück", callback_data="nav:home"))
     return k
 
-def signals_menu_kbd(u: User, is_trader: bool, approved: bool) -> InlineKeyboardMarkup:
-    k = InlineKeyboardMarkup(row_width=2)
-    k.add(InlineKeyboardButton("📜 Öffentliche Trader", callback_data="sig:list"))
+def kb_balance() -> InlineKeyboardMarkup:
+    k = InlineKeyboardMarkup()
+    k.row(InlineKeyboardButton("➕ Deposit", callback_data="bal:dep"),
+          InlineKeyboardButton("➖ Withdraw", callback_data="bal:wdr"))
+    k.row(InlineKeyboardButton("⬅️ Zurück", callback_data="nav:home"))
+    return k
+
+def kb_trader_hub(is_trader: bool, approved: bool) -> InlineKeyboardMarkup:
+    k = InlineKeyboardMarkup()
     if not is_trader:
-        k.add(InlineKeyboardButton("📥 Trader werden", callback_data="sig:apply"))
+        k.row(InlineKeyboardButton("📝 Trader werden", callback_data="tr:apply"))
+    elif is_trader and not approved:
+        k.row(InlineKeyboardButton("⏳ Wartet auf Freigabe", callback_data="noop"))
     else:
-        if approved:
-            k.add(
-                InlineKeyboardButton("➕ Signal – MemeCoin", callback_data="sig:new:memecoin"),
-                InlineKeyboardButton("➕ Signal – Futures",  callback_data="sig:new:futures"),
-            )
-            k.add(InlineKeyboardButton("➕ Signal – Lux", callback_data="sig:new:lux"))
-            k.add(InlineKeyboardButton("💵 Wochenpreis setzen", callback_data="sig:setprice"))
-        else:
-            k.add(InlineKeyboardButton("⏳ Wartet auf Freigabe", callback_data="sig:pending"))
-    k.add(InlineKeyboardButton("🔙 Zurück", callback_data="menu:main"))
+        k.row(InlineKeyboardButton("📨 Signal senden", callback_data="tr:signal"))
+        k.row(InlineKeyboardButton("💵 Preis setzen", callback_data="tr:price"))
+    k.row(InlineKeyboardButton("👥 Trader-Liste", callback_data="tr:list"))
+    k.row(InlineKeyboardButton("⬅️ Zurück", callback_data="nav:home"))
     return k
 
-def wallet_menu_kbd() -> InlineKeyboardMarkup:
-    k = InlineKeyboardMarkup(row_width=2)
-    k.add(InlineKeyboardButton("➕ Einzahlen", callback_data="pay:deposit"),
-          InlineKeyboardButton("➖ Auszahlen", callback_data="pay:withdraw"))
-    k.add(InlineKeyboardButton("🔙 Zurück", callback_data="menu:main"))
+def kb_trader_list(traders: List[Trader], page: int=0, page_size: int=5) -> InlineKeyboardMarkup:
+    k = InlineKeyboardMarkup()
+    start = page*page_size
+    for tr in traders[start:start+page_size]:
+        tag = f"@{tr.user_id}"
+        k.row(InlineKeyboardButton(f"👤 Trader {tr.user_id} • {tr.weekly_price:.2f}/w", callback_data=f"tr:view:{tr.id}"))
+    nav = []
+    if page>0: nav.append(InlineKeyboardButton("◀️", callback_data=f"tr:page:{page-1}"))
+    if start+page_size < len(traders): nav.append(InlineKeyboardButton("▶️", callback_data=f"tr:page:{page+1}"))
+    if nav: k.row(*nav)
+    k.row(InlineKeyboardButton("⬅️ Zurück", callback_data="nav:traders"))
     return k
 
-def admin_menu_kbd() -> InlineKeyboardMarkup:
-    k = InlineKeyboardMarkup(row_width=2)
-    k.add(InlineKeyboardButton("➕ Market erstellen", callback_data="adm:newmkt"))
-    k.add(InlineKeyboardButton("👤 Trader freischalten", callback_data="adm:approve"))
-    k.add(InlineKeyboardButton("💳 Guthaben +/-", callback_data="adm:balance"))
-    k.add(InlineKeyboardButton("📃 Märkte anzeigen", callback_data="adm:listmkt"))
-    k.add(InlineKeyboardButton("🔒 Market locken", callback_data="adm:lock"))
-    k.add(InlineKeyboardButton("✅ Market settlen", callback_data="adm:settle"))
-    k.add(InlineKeyboardButton("🔙 Zurück", callback_data="menu:main"))
+def kb_trader_view(trader: Trader, you_follow: bool, price: float) -> InlineKeyboardMarkup:
+    k = InlineKeyboardMarkup()
+    if you_follow:
+        k.row(InlineKeyboardButton("❌ Unfollow (Abo beenden)", callback_data=f"tr:unfollow:{trader.id}"))
+    else:
+        k.row(InlineKeyboardButton(f"✅ Follow • {price:.2f} USDC / 7 Tage", callback_data=f"tr:follow:{trader.id}"))
+    k.row(InlineKeyboardButton("⬅️ Zurück", callback_data="tr:list"))
     return k
 
-# ========= Haupt-Menüs =========
+def kb_signal_compose() -> InlineKeyboardMarkup:
+    k = InlineKeyboardMarkup()
+    k.row(InlineKeyboardButton("🟢 MemeCoin", callback_data="sg:type:memecoin"),
+          InlineKeyboardButton("🔵 Futures", callback_data="sg:type:futures"))
+    k.row(InlineKeyboardButton("💜 Lux", callback_data="sg:type:lux"))
+    k.row(InlineKeyboardButton("⬅️ Zurück", callback_data="nav:traders"))
+    return k
+
+def kb_markets_admin() -> InlineKeyboardMarkup:
+    k = InlineKeyboardMarkup()
+    k.row(InlineKeyboardButton("➕ Markt anlegen", callback_data="mk:new"))
+    k.row(InlineKeyboardButton("📋 Offene Märkte", callback_data="mk:list"))
+    k.row(InlineKeyboardButton("⬅️ Zurück", callback_data="nav:home"))
+    return k
+
+def kb_markets_user() -> InlineKeyboardMarkup:
+    k = InlineKeyboardMarkup()
+    k.row(InlineKeyboardButton("📋 Märkte anzeigen", callback_data="mk:list"))
+    k.row(InlineKeyboardButton("⬅️ Zurück", callback_data="nav:home"))
+    return k
+
+def kb_market_view(m: Market, you_can_bet: bool=True) -> InlineKeyboardMarkup:
+    k = InlineKeyboardMarkup()
+    if you_can_bet and m.status=="open":
+        for a in [1,5,10,25,50]:
+            k.row(InlineKeyboardButton(f"YES {a}", callback_data=f"mkb:yes:{m.id}:{a}"),
+                  InlineKeyboardButton(f"NO {a}",  callback_data=f"mkb:no:{m.id}:{a}"))
+        k.row(InlineKeyboardButton("ALL-IN YES", callback_data=f"mkb:yes:{m.id}:ALL"),
+              InlineKeyboardButton("ALL-IN NO",  callback_data=f"mkb:no:{m.id}:ALL"))
+    k.row(InlineKeyboardButton("⬅️ Zurück", callback_data="mk:list"))
+    return k
+
+def kb_admin_panel() -> InlineKeyboardMarkup:
+    k = InlineKeyboardMarkup()
+    k.row(InlineKeyboardButton("👤 Trader-Anträge", callback_data="ad:tr_reqs"))
+    k.row(InlineKeyboardButton("📊 Prediction Markets", callback_data="nav:mk_admin"))
+    k.row(InlineKeyboardButton("💵 Auszahlungen", callback_data="ad:wdrs"))
+    k.row(InlineKeyboardButton("⬅️ Zurück", callback_data="nav:home"))
+    return k
+
+# ========= COMMANDS =========
 @bot.message_handler(commands=["start"])
-def on_start(message: Message):
-    u = ensure_user(message)
-    db = get_session()
+def cmd_start(message: Message):
+    u = get_or_create_user(message)
+    db = db_sess()
     try:
-        usdc = get_balance(db, u.id, "USDC")
-        text = (f"Willkommen bei <b>PulsePlay</b> 👋\n\n"
-                f"👤 User: <b>@{esc(u.username) or u.telegram_id}</b>\n"
-                f"💰 USDC: <b>{usdc:.2f}</b>\n\n"
-                f"Wähle unten eine Funktion.")
-        bot.send_message(message.chat.id, text, reply_markup=main_menu_kbd(u, db))
+        if is_admin(int(u.telegram_id)):
+            u.role = "admin"; db.commit()
+        text = (
+            "<b>PulsePlay</b>\n"
+            "Willkommen! Nutze die Buttons, kein Tippen nötig.\n"
+            "• Coinflip (30% hidden odds)\n"
+            "• Trader folgen (Abo 7 Tage, 80/20 Split)\n"
+            "• Manuelle Signale (MemeCoin/Futures/Lux)\n"
+            "• Prediction Markets (YES/NO)\n"
+            "• Solana-Deposit & Withdraw\n"
+        )
+        bot.send_message(message.chat.id, text, reply_markup=kb_main(u, db))
     finally:
         db.close()
 
-def show_main(chat_id: int, tg_id: int):
-    u = ensure_user_by_id(tg_id)
-    db = get_session()
+# ========= NAVIGATION =========
+@bot.callback_query_handler(func=lambda c: c.data.startswith("nav:"))
+def on_nav(call: CallbackQuery):
+    db = db_sess()
     try:
-        usdc = get_balance(db, u.id, "USDC")
-        text = (f"<b>Hauptmenü</b>\n\n"
-                f"💰 USDC: <b>{usdc:.2f}</b>")
-        bot.edit_message_text(text, chat_id, bot.get_last_message_id(chat_id) if False else None)
-    finally:
-        db.close()
-
-# ========= Callbacks =========
-@bot.callback_query_handler(func=lambda c: True)
-def on_cb(call: CallbackQuery):
-    try:
-        u = ensure_user_by_id(call.from_user.id, call.from_user.username or "")
-        data = call.data or ""
-        db = get_session()
-        try:
-            # Menüs
-            if data == "menu:main":
-                usdc = get_balance(db, u.id, "USDC")
-                bot.edit_message_text(f"<b>Hauptmenü</b>\n\n💰 USDC: <b>{usdc:.2f}</b>",
-                                      call.message.chat.id, call.message.message_id,
-                                      reply_markup=main_menu_kbd(u, db))
-            elif data == "menu:markets":
-                _show_markets(db, call, u)
-            elif data == "menu:coinflip":
-                bot.edit_message_text("🪙 <b>Coinflip</b>\nWähle Kopf/Zahl und Betrag.",
-                                      call.message.chat.id, call.message.message_id,
-                                      reply_markup=coinflip_menu_kbd())
-            elif data == "menu:signals":
-                _show_signals_menu(db, call, u)
-            elif data == "menu:wallet":
-                _show_wallet_menu(db, call, u)
-            elif data == "menu:help":
-                bot.edit_message_text(esc("Hilfe:\n- Märkte: YES/NO Wetten (+% oder above:Preis)\n- Coinflip: 50/50-Style (intern 30% Gewinnchance), Auszahlung 2x\n- Signale: Trader posten Signale (MemeCoin, Futures, Lux). Follower können Wochenabo bezahlen.\n- Ein-/Auszahlungen: USDC/SOL über zentrale Solana-Adresse. /verify nutzt RPC."),
-                                      call.message.chat.id, call.message.message_id,
-                                      reply_markup=main_menu_kbd(u, db))
-
-            # Märkte
-            elif data.startswith("bet:"):
-                _, mid, side = data.split(":")
-                _place_bet(db, u, call, int(mid), side)
-            elif data.startswith("mkt:open:"):
-                _, _, mid = data.split(":")
-                _show_single_market(db, call, int(mid))
-
-            # Coinflip
-            elif data.startswith("cf:"):
-                # Kopf/Zahl Vorauswahl
-                _, side = data.split(":")
-                state = _get_cf_state(u.telegram_id)
-                state["side"] = side
-                _set_cf_state(u.telegram_id, state)
-                bot.answer_callback_query(call.id, f"Gewählt: {side}")
-            elif data.startswith("cfamt:"):
-                _, amt = data.split(":")
-                state = _get_cf_state(u.telegram_id)
-                state["amount"] = float(amt)
-                _set_cf_state(u.telegram_id, state)
-                _coinflip_play(db, u.id, call, state.get("side"), state.get("amount"))
-
-            # Signale
-            elif data == "sig:list":
-                _signals_list_public(db, call, u)
-            elif data == "sig:apply":
-                _trader_apply(db, call, u)
-            elif data == "sig:pending":
-                bot.answer_callback_query(call.id, "Dein Trader-Profil wartet auf Freischaltung.")
-            elif data.startswith("sig:new:"):
-                _, _, cat = data.split(":")
-                _trader_new_signal_prompt(db, call, u, cat)
-            elif data == "sig:setprice":
-                _trader_set_price_prompt(db, call, u)
-            elif data.startswith("sig:follow:"):
-                _, _, tid = data.split(":")
-                _follow_trader(db, call, u, int(tid))
-            elif data.startswith("sig:buyweek:"):
-                _, _, tid, price = data.split(":")
-                _buy_week(db, call, u, int(tid), float(price))
-
-            # Wallet
-            elif data == "pay:deposit":
-                _deposit_prompt(db, call, u)
-            elif data == "pay:withdraw":
-                _withdraw_prompt(db, call, u)
-
-            # Admin
-            elif data == "menu:admin":
-                if not is_admin(int(u.telegram_id)):
-                    bot.answer_callback_query(call.id, "Kein Admin.")
-                else:
-                    bot.edit_message_text("<b>Admin</b>", call.message.chat.id, call.message.message_id,
-                                          reply_markup=admin_menu_kbd())
-            elif data == "adm:newmkt":
-                _admin_new_market_prompt(db, call, u)
-            elif data == "adm:approve":
-                _admin_approve_trader_prompt(db, call, u)
-            elif data == "adm:balance":
-                _admin_balance_prompt(db, call, u)
-            elif data == "adm:listmkt":
-                _admin_list_markets(db, call, u)
-            elif data == "adm:lock":
-                _admin_lock_prompt(db, call, u)
-            elif data == "adm:settle":
-                _admin_settle_prompt(db, call, u)
-
+        u = db.query(User).filter(User.telegram_id==str(call.from_user.id)).first()
+        if not u:
+            u = get_or_create_user(call.message)
+        if call.data=="nav:home":
+            bot.edit_message_text("🏠 Hauptmenü", call.message.chat.id, call.message.message_id, reply_markup=kb_main(u, db))
+        elif call.data=="nav:coinflip":
+            bot.edit_message_text("🎮 <b>Coinflip</b>\nWähle Kopf/Zahl und Einsatz.", call.message.chat.id, call.message.message_id, reply_markup=kb_coinflip())
+        elif call.data=="nav:balance":
+            usdc = get_balance(db, u.id, "USDC"); sol = get_balance(db, u.id, "SOL")
+            bot.edit_message_text(f"💰 <b>Dein Kontostand</b>\nUSDC: {usdc:.2f}\nSOL: {sol:.4f}", call.message.chat.id, call.message.message_id, reply_markup=kb_balance())
+        elif call.data=="nav:traders":
+            tr = db.query(Trader).filter(Trader.user_id==u.id).first()
+            bot.edit_message_text("📣 <b>Trader-Hub</b>", call.message.chat.id, call.message.message_id, reply_markup=kb_trader_hub(bool(tr), bool(tr and tr.approved)))
+        elif call.data=="nav:markets":
+            text = "📊 Prediction Markets"
+            if is_admin(call.from_user.id):
+                bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb_markets_admin())
             else:
-                bot.answer_callback_query(call.id, "Unbekannte Aktion.")
-        finally:
-            db.close()
-    except Exception as e:
-        dbg(f"callback error: {e}")
-        try:
-            bot.answer_callback_query(call.id, f"Error: {e}")
-        except: pass
-
-# ========= Coinflip – einfacher State (im Speicher) =========
-_CF_STATE = {}
-def _get_cf_state(tg_id: int) -> dict:
-    return _CF_STATE.get(tg_id, {"side": None, "amount": None})
-def _set_cf_state(tg_id: int, state: dict):
-    _CF_STATE[tg_id] = state
-
-def _coinflip_play(db, user_id: int, call: CallbackQuery, side: Optional[str], amount: Optional[float]):
-    if side not in ("HEADS","TAILS"):
-        bot.answer_callback_query(call.id, "Bitte erst Kopf/Zahl wählen."); return
-    if not amount or amount <= 0:
-        bot.answer_callback_query(call.id, "Bitte Betrag wählen."); return
-    bal = get_balance(db, user_id, "USDC")
-    if bal < amount:
-        bot.answer_callback_query(call.id, f"Zu wenig Guthaben ({bal:.2f} USDC)."); return
-    # abziehen
-    upsert_balance(db, user_id, "USDC", -amount)
-    win = (random.random() < COINFLIP_WIN_PROB)
-    if win:
-        payout = amount * COINFLIP_PAYOUT_MULT
-        upsert_balance(db, user_id, "USDC", payout)
-        bot.edit_message_text(f"🪙 <b>Coinflip</b>\nDu hast <b>{side}</b> gewählt.\n"
-                              f"🎉 <b>Gewonnen!</b> Auszahlung: <b>{payout:.2f} USDC</b>",
-                              call.message.chat.id, call.message.message_id,
-                              reply_markup=coinflip_menu_kbd())
-    else:
-        bot.edit_message_text(f"🪙 <b>Coinflip</b>\nDu hast <b>{side}</b> gewählt.\n"
-                              f"💥 <b>Verloren.</b> Einsatz: {amount:.2f} USDC",
-                              call.message.chat.id, call.message.message_id,
-                              reply_markup=coinflip_menu_kbd())
-
-# ========= Märkte =========
-def _show_markets(db, call, u: User):
-    ms = db.query(Market).filter(Market.status.in_(["open","locked"])).order_by(Market.lock_at.asc()).limit(10).all()
-    if not ms:
-        bot.edit_message_text("📊 Keine offenen Märkte.", call.message.chat.id, call.message.message_id,
-                              reply_markup=main_menu_kbd(u, db))
-        return
-    lines = ["<b>Offene/Lockte Märkte</b>"]
-    k = InlineKeyboardMarkup()
-    for m in ms:
-        left_lock = max(0, int((m.lock_at - now_utc()).total_seconds())) if m.lock_at else 0
-        left_settle = max(0, int((m.settle_at - now_utc()).total_seconds())) if m.settle_at else 0
-        lines.append(f"#{m.id} {m.symbol} {m.condition} | {m.status} | "
-                     f"Lock in: {left_lock//60}m | Settle in: {left_settle//60}m")
-        k.add(InlineKeyboardButton(f"Market #{m.id} öffnen", callback_data=f"mkt:open:{m.id}"))
-    k.add(InlineKeyboardButton("🔙 Zurück", callback_data="menu:main"))
-    bot.edit_message_text("\n".join(lines), call.message.chat.id, call.message.message_id, reply_markup=k)
-
-def _show_single_market(db, call, mid: int):
-    m = db.query(Market).filter(Market.id==mid).first()
-    if not m:
-        bot.answer_callback_query(call.id, "Market nicht gefunden."); return
-    is_open = (m.status=="open" and m.lock_at>now_utc())
-    p = get_price(m.symbol) or 0.0
-    left_lock = max(0, int((m.lock_at - now_utc()).total_seconds()))
-    text = (f"<b>Market #{m.id}</b>\n"
-            f"Symbol: <b>{esc(m.symbol)}</b>\n"
-            f"Bedingung: <b>{esc(m.condition)}</b>\n"
-            f"Status: <b>{m.status}</b>\n"
-            f"Referenz: <b>{m.reference_price:.6f} USD</b>\n"
-            f"Aktuell: <b>{p:.6f} USD</b>\n"
-            f"Lock in: <b>{left_lock//60}m</b>\n"
-            f"Settle: <b>{m.settle_at.strftime('%Y-%m-%d %H:%M UTC')}</b>")
-    bot.edit_message_text(text, call.message.chat.id, call.message.message_id,
-                          reply_markup=markets_kbd(m, is_open))
-
-def _place_bet(db, u: User, call, mid: int, side: str):
-    m = db.query(Market).filter(Market.id==mid).first()
-    if not m:
-        bot.answer_callback_query(call.id, "Market nicht gefunden."); return
-    if m.status!="open" or m.lock_at<=now_utc():
-        bot.answer_callback_query(call.id, "Market ist gelockt."); return
-    # Einsatz per Schnellbuttons anbieten
-    k = InlineKeyboardMarkup()
-    for amt in [1,5,10,25,50]:
-        k.add(InlineKeyboardButton(f"{side} – {amt} USDC setzen", callback_data=f"betplace:{mid}:{side}:{amt}"))
-    k.add(InlineKeyboardButton("Abbrechen", callback_data=f"mkt:open:{mid}"))
-    bot.edit_message_text(f"Einsatz wählen für #{mid} {m.symbol} ({side})", call.message.chat.id, call.message.message_id, reply_markup=k)
-
-@bot.callback_query_handler(func=lambda c: c.data.startswith("betplace:"))
-def on_bet_place(call: CallbackQuery):
-    try:
-        u = ensure_user_by_id(call.from_user.id, call.from_user.username or "")
-        _, mid, side, amt = call.data.split(":")
-        mid = int(mid); amt = float(amt)
-        db = get_session()
-        try:
-            m = db.query(Market).filter(Market.id==mid).first()
-            if not m or m.status!="open" or m.lock_at<=now_utc():
-                bot.answer_callback_query(call.id, "Market nicht offen."); return
-            bal = get_balance(db, u.id, "USDC")
-            if bal < amt:
-                bot.answer_callback_query(call.id, f"Zu wenig Guthaben ({bal:.2f})."); return
-            upsert_balance(db, u.id, "USDC", -amt)
-            b = Bet(market_id=mid, user_id=u.id, side=side, stake=amt, fee=0.0, payout=0.0)
-            db.add(b); db.commit()
-            bot.edit_message_text(f"✅ Einsatz platziert: {side} {amt:.2f} USDC auf Market #{mid}",
-                                  call.message.chat.id, call.message.message_id,
-                                  reply_markup=markets_kbd(m, True))
-        finally:
-            db.close()
-    except Exception as e:
-        dbg(f"betplace error: {e}")
-        try: bot.answer_callback_query(call.id, f"Error: {e}")
-        except: pass
-
-# ========= Signale =========
-def _get_trader(db, user_id: int) -> Optional[Trader]:
-    return db.query(Trader).filter(Trader.user_id==user_id).first()
-
-def _show_signals_menu(db, call, u: User):
-    t = _get_trader(db, u.id)
-    is_trader = t is not None
-    approved = t.is_approved if t else False
-    bot.edit_message_text("<b>Signale</b>", call.message.chat.id, call.message.message_id,
-                          reply_markup=signals_menu_kbd(u, is_trader, approved))
-
-def _signals_list_public(db, call, u: User):
-    ts = db.query(Trader).filter(Trader.is_approved==True).all()
-    if not ts:
-        bot.edit_message_text("Es gibt noch keine freigeschalteten Trader.",
-                              call.message.chat.id, call.message.message_id,
-                              reply_markup=signals_menu_kbd(u, _get_trader(db,u.id) is not None, (_get_trader(db,u.id) or Trader(is_approved=False)).is_approved if _get_trader(db,u.id) else False))
-        return
-    lines = ["<b>Trader</b>"]
-    k = InlineKeyboardMarkup()
-    for t in ts:
-        owner = db.query(User).filter(User.id==t.user_id).first()
-        uname = owner.username or owner.telegram_id
-        price = t.weekly_price_usdc
-        lines.append(f"• @{esc(uname)} – Woche: {price:.2f} USDC")
-        k.add(InlineKeyboardButton(f"Folgen/Abonnieren @{uname}", callback_data=f"sig:follow:{t.id}"))
-        k.add(InlineKeyboardButton(f"Woche kaufen ({price:.2f} USDC)", callback_data=f"sig:buyweek:{t.id}:{price}"))
-    k.add(InlineKeyboardButton("🔙 Zurück", callback_data="menu:signals"))
-    bot.edit_message_text("\n".join(lines), call.message.chat.id, call.message.message_id, reply_markup=k)
-
-def _follow_trader(db, call, u: User, tid: int):
-    t = db.query(Trader).filter(Trader.id==tid, Trader.is_approved==True).first()
-    if not t:
-        bot.answer_callback_query(call.id, "Trader nicht gefunden."); return
-    # follow ohne Zahlung (reine Follow-Liste)
-    try:
-        f = Follow(follower_id=u.id, trader_id=tid)
-        db.add(f); db.commit()
-    except Exception:  # unique
-        pass
-    bot.answer_callback_query(call.id, "Du folgst diesem Trader jetzt.")
-
-def _buy_week(db, call, u: User, tid: int, price: float):
-    bal = get_balance(db, u.id, "USDC")
-    if bal < price:
-        bot.answer_callback_query(call.id, f"Zu wenig Guthaben ({bal:.2f})."); return
-    upsert_balance(db, u.id, "USDC", -price)
-    bot.answer_callback_query(call.id, f"Abo-Woche gekauft ({price:.2f} USDC).")
-    # (Optional: Zugriff/Whitelist markieren)
-
-def _trader_apply(db, call, u: User):
-    t = _get_trader(db, u.id)
-    if t:
-        bot.answer_callback_query(call.id, "Du bist bereits registriert (wartend oder frei)."); return
-    t = Trader(user_id=u.id, is_approved=False, weekly_price_usdc=19.0)
-    db.add(t); db.commit()
-    bot.answer_callback_query(call.id, "Antrag gesendet. Admin wird dich freischalten.")
-    # Admin informieren
-    for aid in ADMIN_IDS:
-        try:
-            bot.send_message(aid, f"🔔 Trader-Antrag von @{u.username or u.telegram_id}")
-        except: pass
-
-def _trader_new_signal_prompt(db, call, u: User, category: str):
-    t = _get_trader(db, u.id)
-    if not t or not t.is_approved:
-        bot.answer_callback_query(call.id, "Nur freigeschaltete Trader."); return
-    bot.edit_message_text(f"Schicke den Signal-Text hier im Chat.\nKategorie: <b>{category}</b>\n(Die nächste Nachricht wird als Signal gespeichert und an Follower gesendet.)",
-                          call.message.chat.id, call.message.message_id)
-    _PENDING_SIGNAL[u.telegram_id] = category
-
-_PENDING_SIGNAL = {}  # tg_id -> category
-
-@bot.message_handler(func=lambda m: m.chat.type in ("private","group","supergroup"))
-def on_text(message: Message):
-    # Signal-Eingabe?
-    tg_id = message.from_user.id
-    if tg_id in _PENDING_SIGNAL:
-        category = _PENDING_SIGNAL.pop(tg_id)
-        u = ensure_user(message)
-        db = get_session()
-        try:
-            t = _get_trader(db, u.id)
-            if not t or not t.is_approved:
-                bot.reply_to(message, "Nur freigeschaltete Trader."); return
-            s = ManualSignal(trader_id=t.id, category=category, text=message.text)
-            db.add(s); db.commit()
-            # an Follower senden
-            fols = db.query(Follow).filter(Follow.trader_id==t.id).all()
-            owner = db.query(User).filter(User.id==t.user_id).first()
-            uname = owner.username or owner.telegram_id
-            out = (f"📢 <b>Signal</b> – <i>{category}</i>\n"
-                   f"von @{esc(uname)}\n\n{esc(message.text)}")
-            for f in fols:
-                try:
-                    fu = db.query(User).filter(User.id==f.follower_id).first()
-                    bot.send_message(int(fu.telegram_id), out)
-                except Exception as e:
-                    dbg(f"send follower signal error: {e}")
-            bot.reply_to(message, "Signal gesendet ✅")
-        finally:
-            db.close()
-        return
-
-# ========= Wallet – Ein-/Auszahlungen =========
-def _show_wallet_menu(db, call, u: User):
-    usdc = get_balance(db, u.id, "USDC")
-    txt = (f"<b>Wallet</b>\n"
-           f"USDC: <b>{usdc:.2f}</b>\n\n"
-           f"Einzahlung geht an:\n<code>{CENTRAL_DEPOSIT_ADDRESS}</code>\n"
-           f"Nach Senden -> Verifizieren.")
-    bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=wallet_menu_kbd())
-
-def _deposit_prompt(db, call, u: User):
-    txt = ("🔹 <b>Einzahlen</b>\n"
-           "Sende SOL oder USDC an die zentrale Adresse und antworte hier:\n"
-           "<code>/deposit &lt;amount&gt; &lt;dein_sender_wallet&gt;</code>\n"
-           "Beispiel:\n<code>/deposit 25 CKZEp...M1s</code>\n"
-           "Danach: <code>/verify &lt;payment_id&gt;</code>")
-    bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=wallet_menu_kbd())
-
-def _withdraw_prompt(db, call, u: User):
-    txt = ("🔹 <b>Auszahlen</b>\n"
-           "Antworte hier:\n<code>/withdraw &lt;amount&gt; &lt;ziel_wallet&gt;</code>")
-    bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=wallet_menu_kbd())
-
-@bot.message_handler(commands=["deposit"])
-def cmd_deposit(message: Message):
-    u = ensure_user(message)
-    parts = message.text.split()
-    if len(parts)!=3:
-        bot.reply_to(message, esc("Usage: /deposit <amount> <your_sender_wallet>")); return
-    try:
-        amt = float(parts[1]); assert amt>0
-    except:
-        bot.reply_to(message, "Amount muss >0 sein."); return
-    sender = parts[2]
-    db = get_session()
-    try:
-        p = Payment(user_id=u.id, type="deposit", method="solana", amount=amt, status="pending", meta=json.dumps({"sender":sender}))
-        db.add(p); db.commit()
-        bot.reply_to(message, f"Einzahlungs-Request #{p.id} erstellt.\nSende an: <code>{CENTRAL_DEPOSIT_ADDRESS}</code>\nNach dem Senden: /verify {p.id}")
+                bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb_markets_user())
+        elif call.data=="nav:mk_admin":
+            bot.edit_message_text("👔 Admin • Markets", call.message.chat.id, call.message.message_id, reply_markup=kb_markets_admin())
+        elif call.data=="nav:admin":
+            if not is_admin(call.from_user.id):
+                bot.answer_callback_query(call.id, "Nur für Admins.")
+                return
+            bot.edit_message_text("🛠 Admin-Panel", call.message.chat.id, call.message.message_id, reply_markup=kb_admin_panel())
+        elif call.data=="nav:help":
+            bot.edit_message_text(esc("Hilfe:\n• /start – Menü neu öffnen\n• Buttons benutzen 🙂"), call.message.chat.id, call.message.message_id, reply_markup=kb_main(u, db))
     finally:
         db.close()
 
+# ========= COINFLIP =========
+def _coinflip_play(db, user_id: int, call: CallbackQuery, side: str, amount: float):
+    bal = get_balance(db, user_id, "USDC")
+    stake = bal if amount == -1 else amount
+    if stake <= 0.0:
+        bot.answer_callback_query(call.id, "Kein Einsatz.")
+        return
+    if bal < stake:
+        bot.answer_callback_query(call.id, "Zu wenig Guthaben.")
+        return
+    # deduct
+    upsert_balance(db, user_id, "USDC", -stake)
+    win = random.random() < COINFLIP_WIN_PROB
+    if win:
+        payout = round(stake * COINFLIP_PAYOUT_MULT, 6)
+        upsert_balance(db, user_id, "USDC", payout)
+        bot.answer_callback_query(call.id, f"Gewonnen! +{payout:.2f} USDC")
+    else:
+        bot.answer_callback_query(call.id, f"Verloren. -{stake:.2f} USDC")
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("cf:"))
+def on_cf(call: CallbackQuery):
+    try:
+        _, side, amt = call.data.split(":")
+        if amt == "ALL":
+            amount = -1.0
+        else:
+            amount = float(amt)
+    except:
+        bot.answer_callback_query(call.id, "Fehlerhafte Eingabe.")
+        return
+    db = db_sess()
+    try:
+        u = db.query(User).filter(User.telegram_id==str(call.from_user.id)).first()
+        if not u:
+            bot.answer_callback_query(call.id, "Bitte /start nutzen.")
+            return
+        _coinflip_play(db, u.id, call, side, amount)
+        # refresh balance card
+        usdc = get_balance(db, u.id, "USDC"); sol = get_balance(db, u.id, "SOL")
+        bot.edit_message_text(f"🎮 Coinflip\nUSDC: {usdc:.2f} | SOL: {sol:.4f}", call.message.chat.id, call.message.message_id, reply_markup=kb_coinflip())
+    finally:
+        db.close()
+
+# ========= BALANCE =========
+@bot.callback_query_handler(func=lambda c: c.data.startswith("bal:"))
+def on_bal(call: CallbackQuery):
+    db = db_sess()
+    try:
+        u = db.query(User).filter(User.telegram_id==str(call.from_user.id)).first()
+        if not u:
+            bot.answer_callback_query(call.id, "Bitte /start nutzen.")
+            return
+        if call.data == "bal:dep":
+            p = Payment(user_id=u.id, type="deposit", amount=0.0, status="pending", meta=json.dumps({"info":"awaiting"}))
+            db.add(p); db.commit()
+            txt = (f"🔹 <b>Deposit erstellen</b>\n"
+                   f"• Ziel (zentral): <code>{CENTRAL_DEPOSIT_ADDRESS}</code>\n"
+                   f"• Sende USDC (Token) oder SOL\n"
+                   f"• Danach: /verify {p.id}\n")
+            bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=kb_balance())
+        elif call.data == "bal:wdr":
+            bot.answer_callback_query(call.id, "Schreibe dem Admin deinen Auszahlungswunsch mit Adresse.")
+    finally:
+        db.close()
+
+# /verify <payment_id>
 @bot.message_handler(commands=["verify"])
 def cmd_verify(message: Message):
-    u = ensure_user(message)
     parts = message.text.split()
     if len(parts)!=2 or not parts[1].isdigit():
-        bot.reply_to(message, esc("Usage: /verify <payment_id>")); return
+        bot.reply_to(message, esc("Nutzung: /verify <payment_id>"))
+        return
     pid = int(parts[1])
-    db = get_session()
+    db = db_sess()
     try:
-        p = db.query(Payment).filter(Payment.id==pid, Payment.user_id==u.id, Payment.type=="deposit", Payment.status!="completed").first()
-        if not p:
-            bot.reply_to(message, "Einzahlung nicht gefunden/abgeschlossen."); return
-        meta = json.loads(p.meta or "{}")
-        sender = meta.get("sender")
-        if not sender:
-            bot.reply_to(message, "Kein Sender-Wallet hinterlegt."); return
+        u = get_or_create_user(message)
+        p: Payment = db.query(Payment).filter(Payment.id==pid, Payment.user_id==u.id, Payment.type=="deposit").first()
+        if not p or p.status=="completed":
+            bot.reply_to(message, "Deposit nicht gefunden oder bereits verbucht.")
+            return
         sigs = get_sigs_for_address(CENTRAL_DEPOSIT_ADDRESS, limit=40)
-        matched = False
+        matched=False
         for s in sigs:
             sig = s["signature"]
-            tx = get_tx(sig)
-            keys = get_account_keys(tx)
-            if sender not in keys:
-                continue
-            transfers = parse_token_transfers(tx)
-            inflow_sol = 0.0; inflow_usdc = 0.0
-            for t in transfers:
-                if t["mint"]=="SOL":
-                    inflow_sol += max(0.0, t["amount"])
-                elif t["mint"]==USDC_SOLANA_MINT:
-                    inflow_usdc += max(0.0, t["amount"])
-            if inflow_sol>=p.amount or inflow_usdc>=p.amount:
-                currency = "USDC" if inflow_usdc>0 else "SOL"
-                credit = inflow_usdc if inflow_usdc>0 else (inflow_sol * (get_price("SOL") or 0.0))
+            txj = get_tx(sig)
+            transfers = parse_token_transfers(txj)
+            inflow_sol = sum(max(0.0,t["amount"]) for t in transfers if t["mint"]=="SOL")
+            inflow_usdc = sum(max(0.0,t["amount"]) for t in transfers if t["mint"]==USDC_SOLANA_MINT)
+            if inflow_sol>0 or inflow_usdc>0:
+                credit = inflow_usdc if inflow_usdc>0 else (inflow_sol*(get_price("SOL") or 0))
                 upsert_balance(db, u.id, "USDC", credit)
-                p.status="completed"; p.tx=sig; db.commit()
-                bot.reply_to(message, f"✅ Deposit verifiziert. Gutschrift: {credit:.4f} USDC (via {currency}).")
-                matched = True; break
+                p.status="completed"; p.tx=sig; p.amount=credit; db.commit()
+                bot.reply_to(message, f"✅ Deposit verbucht: +{credit:.4f} USDC")
+                matched=True
+                break
         if not matched:
-            bot.reply_to(message, "Keine passende Transaktion gefunden. Später erneut versuchen.")
+            bot.reply_to(message, "Noch keine passende Transaktion gefunden. Später erneut /verify ausführen.")
     except Exception as e:
-        bot.reply_to(message, f"Error: {e}")
+        bot.reply_to(message, f"Fehler: {e}")
     finally:
         db.close()
 
-@bot.message_handler(commands=["withdraw"])
-def cmd_withdraw(message: Message):
-    u = ensure_user(message)
-    parts = message.text.split()
-    if len(parts)!=3:
-        bot.reply_to(message, esc("Usage: /withdraw <amount> <dest_wallet>")); return
+# ========= TRADER =========
+@bot.callback_query_handler(func=lambda c: c.data.startswith("tr:"))
+def on_trader(call: CallbackQuery):
+    db = db_sess()
     try:
-        amt = float(parts[1]); assert amt>0
-    except:
-        bot.reply_to(message, "Amount muss >0 sein."); return
-    dest = parts[2]
-    db = get_session()
-    try:
-        bal = get_balance(db, u.id, "USDC")
-        if bal < amt:
-            bot.reply_to(message, f"Zu wenig Guthaben ({bal:.2f})."); return
-        upsert_balance(db, u.id, "USDC", -amt)
-        p = Payment(user_id=u.id, type="withdraw", method="solana", amount=amt, status="pending", meta=json.dumps({"dest":dest}))
-        db.add(p); db.commit()
-        bot.reply_to(message, f"✅ Auszahlungs-Request #{p.id} erstellt ({amt:.2f} USDC → {dest}). Admin verarbeitet.")
-        for aid in ADMIN_IDS:
-            try: bot.send_message(aid, f"⚠️ Withdraw #{p.id} von @{u.username or u.telegram_id}: {amt:.2f} → {dest}")
-            except: pass
+        u = db.query(User).filter(User.telegram_id==str(call.from_user.id)).first()
+        if not u: 
+            bot.answer_callback_query(call.id, "Bitte /start nutzen."); return
+        data = call.data.split(":")
+        if data[1]=="apply":
+            tr = db.query(Trader).filter(Trader.user_id==u.id).first()
+            if tr:
+                bot.answer_callback_query(call.id, "Du hast bereits einen Antrag gestellt.")
+                return
+            tr = Trader(user_id=u.id, approved=False, profile=f"Trader @{u.username}", weekly_price=20.0)
+            db.add(tr); db.commit()
+            bot.answer_callback_query(call.id, "Antrag gesendet. Warte auf Freigabe.")
+            for aid in ADMIN_IDS:
+                try:
+                    bot.send_message(aid, f"📥 Trader-Antrag von @{u.username or u.telegram_id} (user_id={u.id}) – im Admin-Panel genehmigen.")
+                except: pass
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=kb_trader_hub(True, False))
+        elif data[1]=="list":
+            trs = db.query(Trader).filter(Trader.approved==True).all()
+            if not trs:
+                bot.answer_callback_query(call.id, "Noch keine Trader.")
+                return
+            bot.edit_message_text("👥 <b>Trader-Liste</b>", call.message.chat.id, call.message.message_id, reply_markup=kb_trader_list(trs, 0))
+        elif data[1]=="page":
+            page=int(data[2]); trs = db.query(Trader).filter(Trader.approved==True).all()
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=kb_trader_list(trs,page))
+        elif data[1]=="view":
+            trid=int(data[2]); tr = db.query(Trader).get(trid)
+            if not tr or not tr.approved:
+                bot.answer_callback_query(call.id, "Trader nicht gefunden."); return
+            you_follow = db.query(Follow).filter(Follow.follower_user_id==u.id, Follow.trader_id==tr.id, Follow.expires_at>datetime.utcnow()).first() is not None
+            bot.edit_message_text(f"👤 Trader {tr.user_id}\nPreis: {tr.weekly_price:.2f} USDC / Woche\n{esc(tr.profile or '')}",
+                                  call.message.chat.id, call.message.message_id,
+                                  reply_markup=kb_trader_view(tr, you_follow, tr.weekly_price))
+        elif data[1]=="follow":
+            trid=int(data[2]); tr = db.query(Trader).get(trid)
+            if not tr or not tr.approved:
+                bot.answer_callback_query(call.id, "Trader nicht verfügbar."); return
+            price = tr.weekly_price
+            bal = get_balance(db, u.id, "USDC")
+            if bal < price:
+                bot.answer_callback_query(call.id, f"Zu wenig Guthaben ({bal:.2f} < {price:.2f}).")
+                return
+            upsert_balance(db, u.id, "USDC", -price)
+            # split
+            trader_cut = round(price*0.80,6); house_cut = round(price*0.20,6)
+            upsert_balance(db, tr.user_id, "USDC", trader_cut)
+            upsert_balance(db, ADMIN_IDS[0], "USDC", house_cut)
+            exp = datetime.utcnow() + timedelta(days=7)
+            # upsert follow
+            f = db.query(Follow).filter(Follow.follower_user_id==u.id, Follow.trader_id==tr.id).first()
+            if not f:
+                f = Follow(follower_user_id=u.id, trader_id=tr.id, started_at=datetime.utcnow(), expires_at=exp)
+                db.add(f)
+            else:
+                f.started_at = datetime.utcnow(); f.expires_at = exp
+            db.commit()
+            bot.answer_callback_query(call.id, "Abo für 7 Tage aktiv.")
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=kb_trader_view(tr, True, tr.weekly_price))
+        elif data[1]=="unfollow":
+            trid=int(data[2]); f = db.query(Follow).filter(Follow.follower_user_id==u.id, Follow.trader_id==trid).first()
+            if not f:
+                bot.answer_callback_query(call.id, "Kein aktives Abo."); return
+            db.delete(f); db.commit()
+            bot.answer_callback_query(call.id, "Abo beendet.")
+            tr = db.query(Trader).get(trid)
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=kb_trader_view(tr, False, tr.weekly_price if tr else 0.0))
+        elif data[1]=="signal":
+            tr = db.query(Trader).filter(Trader.user_id==u.id, Trader.approved==True).first()
+            if not tr:
+                bot.answer_callback_query(call.id, "Nur freigegebene Trader dürfen Signale senden."); return
+            bot.edit_message_text("Signal-Typ wählen:", call.message.chat.id, call.message.message_id, reply_markup=kb_signal_compose())
+        elif data[1]=="price":
+            tr = db.query(Trader).filter(Trader.user_id==u.id).first()
+            if not tr or not tr.approved:
+                bot.answer_callback_query(call.id, "Nur freigegebene Trader."); return
+            tr.weekly_price = max(1.0, tr.weekly_price + 5.0)  # simple demo: +5 USDC pro Klick
+            db.commit()
+            bot.answer_callback_query(call.id, f"Neuer Preis: {tr.weekly_price:.2f} USDC/Woche")
+        else:
+            bot.answer_callback_query(call.id, "Unbekannte Aktion.")
     finally:
         db.close()
 
-# ========= Admin =========
-def _admin_new_market_prompt(db, call, u: User):
-    txt = ("➕ <b>Market erstellen</b>\n"
-           "Antworte mit:\n<code>/newmarket SYMBOL CONDITION TIMEFRAME</code>\n"
-           "Beispiele:\n<code>/newmarket SOL +2% 1h</code>\n<code>/newmarket SOL above:150 4h</code>")
-    bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=admin_menu_kbd())
+# Signal typing state cache (very simple, in-memory)
+SIGNAL_STATE: Dict[int, Dict[str,str]] = {}
 
-@bot.message_handler(commands=["newmarket"])
-def cmd_newmarket(message: Message):
-    if not is_admin(message.from_user.id): return
-    parts = message.text.split()
-    if len(parts)!=4:
-        bot.reply_to(message, esc("Usage: /newmarket <SYMBOL> <+PCT|above:PRICE> <1h|4h|24h>")); return
-    symbol, cond, tf = parts[1].upper(), parts[2], parts[3]
-    if tf not in ("1h","4h","24h"):
-        bot.reply_to(message, "Timeframe: 1h|4h|24h"); return
-    ref = get_price(symbol)
-    if ref is None:
-        bot.reply_to(message, "Preis konnte nicht geladen werden."); return
-    start = now_utc()
-    hours = {"1h":1,"4h":4,"24h":24}[tf]
-    lock = start + timedelta(minutes=5)
-    settle = start + timedelta(hours=hours)
-    db = get_session()
+@bot.callback_query_handler(func=lambda c: c.data.startswith("sg:type:"))
+def on_signal_type(call: CallbackQuery):
+    db = db_sess()
     try:
-        m = Market(symbol=symbol, timeframe=tf, condition=cond, start_at=start, lock_at=lock, settle_at=settle, status="open", reference_price=ref)
-        db.add(m); db.commit()
-        bot.reply_to(message, f"✅ Market #{m.id} erstellt: {symbol} {cond}\nRef: {ref:.6f} USD\nLock: {lock.strftime('%Y-%m-%d %H:%M UTC')}\nSettle: {settle.strftime('%Y-%m-%d %H:%M UTC')}")
+        u = db.query(User).filter(User.telegram_id==str(call.from_user.id)).first()
+        tr = db.query(Trader).filter(Trader.user_id==u.id, Trader.approved==True).first()
+        if not tr:
+            bot.answer_callback_query(call.id, "Nur freigegebene Trader."); return
+        _,_,stype = call.data.split(":")
+        SIGNAL_STATE[u.id] = {"type": stype}
+        bot.answer_callback_query(call.id, f"{stype} ausgewählt. Antworte mit dem Signaltext (einfach hier in den Chat schreiben).")
+        bot.send_message(call.message.chat.id, "Bitte sende jetzt deinen <b>Signaltext</b> (wird an aktive Follower geschickt).")
     finally:
         db.close()
 
-def _admin_approve_trader_prompt(db, call, u: User):
-    ts = db.query(Trader).filter(Trader.is_approved==False).all()
-    if not ts:
-        bot.edit_message_text("Keine ausstehenden Trader-Anträge.", call.message.chat.id, call.message.message_id, reply_markup=admin_menu_kbd()); return
+@bot.message_handler(func=lambda m: True, content_types=['text'])
+def on_any_text(message: Message):
+    # if trader is composing a signal
+    db = db_sess()
+    try:
+        u = get_or_create_user(message)
+        if u.id in SIGNAL_STATE and "type" in SIGNAL_STATE[u.id]:
+            stype = SIGNAL_STATE[u.id]["type"]
+            text = message.text.strip()
+            # deliver to followers
+            tr = db.query(Trader).filter(Trader.user_id==u.id, Trader.approved==True).first()
+            if tr:
+                active = db.query(Follow).filter(Follow.trader_id==tr.id, Follow.expires_at>datetime.utcnow()).all()
+                sent = 0
+                for f in active:
+                    try:
+                        follower = db.query(User).get(f.follower_user_id)
+                        if follower:
+                            bot.send_message(int(follower.telegram_id),
+                                             f"📣 <b>Signal von</b> @{u.username or u.telegram_id} (ID {u.telegram_id})\n"
+                                             f"Typ: <b>{stype.upper()}</b>\n"
+                                             f"{esc(text)}")
+                            sent += 1
+                    except Exception as e:
+                        dbg(f"send signal error: {e}")
+                bot.reply_to(message, f"✅ Signal gesendet an {sent} Abonnenten.")
+            SIGNAL_STATE.pop(u.id, None)
+            return
+        # otherwise default: refresh home UI
+        if message.text.strip().lower() in ("menu","menü","start"):
+            bot.reply_to(message, "Menü:", reply_markup=kb_main(u, db))
+    finally:
+        db.close()
+
+# ========= ADMIN =========
+@bot.callback_query_handler(func=lambda c: c.data.startswith("ad:"))
+def on_admin(call: CallbackQuery):
+    if not is_admin(call.from_user.id):
+        bot.answer_callback_query(call.id, "Nur Admin.")
+        return
+    db = db_sess()
+    try:
+        if call.data=="ad:tr_reqs":
+            reqs = db.query(Trader).filter(Trader.approved==False).all()
+            if not reqs:
+                bot.answer_callback_query(call.id, "Keine offenen Anträge.")
+                return
+            k = InlineKeyboardMarkup()
+            for r in reqs:
+                k.row(InlineKeyboardButton(f"👍 Approve {r.user_id}", callback_data=f"ad:approve:{r.id}"),
+                      InlineKeyboardButton(f"👎 Reject {r.user_id}",  callback_data=f"ad:reject:{r.id}"))
+            k.row(InlineKeyboardButton("⬅️ Zurück", callback_data="nav:admin"))
+            bot.edit_message_text("Offene Trader-Anträge:", call.message.chat.id, call.message.message_id, reply_markup=k)
+        elif call.data.startswith("ad:approve:"):
+            trid=int(call.data.split(":")[2]); tr=db.query(Trader).get(trid)
+            if tr: tr.approved=True; db.commit()
+            bot.answer_callback_query(call.id, "Freigeschaltet."); bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=kb_admin_panel())
+        elif call.data.startswith("ad:reject:"):
+            trid=int(call.data.split(":")[2]); tr=db.query(Trader).get(trid)
+            if tr: db.delete(tr); db.commit()
+            bot.answer_callback_query(call.id, "Abgelehnt."); bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=kb_admin_panel())
+        elif call.data=="ad:wdrs":
+            bot.answer_callback_query(call.id, "Auszahlungsübersicht folgt. (MVP)")
+    finally:
+        db.close()
+
+# ========= MARKETS =========
+NEW_MARKET_STATE: Dict[int, Dict[str,str]] = {}
+
+def kb_market_wizard(state: Dict[str,str]) -> InlineKeyboardMarkup:
     k = InlineKeyboardMarkup()
-    for t in ts:
-        owner = db.query(User).filter(User.id==t.user_id).first()
-        k.add(InlineKeyboardButton(f"Freischalten @{owner.username or owner.telegram_id}", callback_data=f"adm:approve:{t.id}"))
-    k.add(InlineKeyboardButton("🔙 Zurück", callback_data="menu:admin"))
-    bot.edit_message_text("Trader-Anträge:", call.message.chat.id, call.message.message_id, reply_markup=k)
+    step = state.get("step","symbol")
+    if step=="symbol":
+        for s in ["SOL","BTC","ETH","PEPE","BONK","LUX"]:
+            k.row(InlineKeyboardButton(s, callback_data=f"mk:wz:sym:{s}"))
+    elif step=="cond":
+        k.row(InlineKeyboardButton("+2%", callback_data="mk:wz:cond:+2%"),
+              InlineKeyboardButton("+5%", callback_data="mk:wz:cond:+5%"))
+        k.row(InlineKeyboardButton("above:100", callback_data="mk:wz:cond:above:100"))
+    elif step=="tf":
+        for tf in ["1h","4h","24h"]:
+            k.row(InlineKeyboardButton(tf, callback_data=f"mk:wz:tf:{tf}"))
+    elif step=="confirm":
+        k.row(InlineKeyboardButton("✅ Anlegen", callback_data="mk:wz:ok"),
+              InlineKeyboardButton("❌ Abbrechen", callback_data="mk:wz:cancel"))
+    k.row(InlineKeyboardButton("⬅️ Admin", callback_data="nav:mk_admin"))
+    return k
 
-@bot.callback_query_handler(func=lambda c: c.data.startswith("adm:approve:"))
-def on_adm_approve(call: CallbackQuery):
-    if not is_admin(call.from_user.id): 
-        bot.answer_callback_query(call.id, "Kein Admin."); return
-    _, _, tid = call.data.split(":")
-    tid = int(tid)
-    db = get_session()
+@bot.callback_query_handler(func=lambda c: c.data.startswith("mk:"))
+def on_mk(call: CallbackQuery):
+    db = db_sess()
     try:
-        t = db.query(Trader).filter(Trader.id==tid).first()
-        if not t: bot.answer_callback_query(call.id, "Nicht gefunden."); return
-        t.is_approved = True; db.commit()
-        bot.answer_callback_query(call.id, "Freigeschaltet.")
-        owner = db.query(User).filter(User.id==t.user_id).first()
-        try: bot.send_message(int(owner.telegram_id), "✅ Du wurdest als Trader freigeschaltet.")
-        except: pass
+        u = db.query(User).filter(User.telegram_id==str(call.from_user.id)).first()
+        if call.data=="mk:new":
+            if not is_admin(call.from_user.id):
+                bot.answer_callback_query(call.id, "Nur Admin."); return
+            NEW_MARKET_STATE[call.from_user.id] = {"step":"symbol"}
+            bot.edit_message_text("Neuer Markt • Symbol wählen:", call.message.chat.id, call.message.message_id, reply_markup=kb_market_wizard(NEW_MARKET_STATE[call.from_user.id]))
+        elif call.data=="mk:list":
+            ms = db.query(Market).filter(Market.status.in_(["open","locked"])).order_by(Market.lock_at.asc()).all()
+            if not ms:
+                bot.answer_callback_query(call.id, "Keine offenen Märkte.")
+                return
+            k = InlineKeyboardMarkup()
+            for m in ms[:10]:
+                k.row(InlineKeyboardButton(f"#{m.id} {m.symbol} {m.condition} • {m.status}", callback_data=f"mk:view:{m.id}"))
+            k.row(InlineKeyboardButton("⬅️ Zurück", callback_data="nav:markets"))
+            bot.edit_message_text("Offene/gesperrte Märkte:", call.message.chat.id, call.message.message_id, reply_markup=k)
+        elif call.data.startswith("mk:view:"):
+            mid = int(call.data.split(":")[2]); m = db.query(Market).get(mid)
+            if not m:
+                bot.answer_callback_query(call.id, "Markt nicht gefunden."); return
+            now = now_utc()
+            can_bet = (m.status=="open") and (m.lock_at > now)
+            ref = m.reference_price; sp = m.settle_price
+            txt = (f"#{m.id} <b>{m.symbol}</b> {m.condition}\n"
+                   f"Ref: {ref:.6f}\n"
+                   f"Lock: {m.lock_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                   f"Settle: {m.settle_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
+                   f"Status: {m.status}\n"
+                   f"Final: {sp:.6f}")
+            bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=kb_market_view(m, can_bet))
+        elif call.data.startswith("mk:wz:"):
+            if not is_admin(call.from_user.id):
+                bot.answer_callback_query(call.id, "Nur Admin."); return
+            st = NEW_MARKET_STATE.get(call.from_user.id, {"step":"symbol"})
+            parts = call.data.split(":")
+            if parts[2]=="sym":
+                st["symbol"]=parts[3]; st["step"]="cond"
+            elif parts[2]=="cond":
+                st["cond"]=":".join(parts[3:]); st["step"]="tf"
+            elif parts[2]=="tf":
+                st["tf"]=parts[3]; st["step"]="confirm"
+            elif parts[2]=="ok":
+                sym=st.get("symbol"); cond=st.get("cond"); tf=st.get("tf")
+                if not sym or not cond or not tf:
+                    bot.answer_callback_query(call.id, "Unvollständig."); return
+                ref = get_price(sym) or 0.0
+                start = now_utc()
+                lock = start + timedelta(minutes=5)
+                hours = {"1h":1,"4h":4,"24h":24}[tf]
+                settle = start + timedelta(hours=hours)
+                m = Market(symbol=sym, condition=cond, timeframe=tf, status="open",
+                           start_at=start, lock_at=lock, settle_at=settle, reference_price=ref)
+                db.add(m); db.commit()
+                NEW_MARKET_STATE.pop(call.from_user.id, None)
+                bot.answer_callback_query(call.id, f"Markt #{m.id} erstellt.")
+                bot.edit_message_text("Admin • Markets", call.message.chat.id, call.message.message_id, reply_markup=kb_markets_admin())
+            elif parts[2]=="cancel":
+                NEW_MARKET_STATE.pop(call.from_user.id, None)
+                bot.edit_message_text("Admin • Markets", call.message.chat.id, call.message.message_id, reply_markup=kb_markets_admin())
+            NEW_MARKET_STATE[call.from_user.id]=st
+            if st.get("step")!="confirm":
+                stepshow={"symbol":"Symbol","cond":"Bedingung","tf":"Timeframe"}
+                bot.edit_message_text(f"Neuer Markt • {stepshow.get(st['step'],'...')} wählen:", call.message.chat.id, call.message.message_id, reply_markup=kb_market_wizard(st))
+            else:
+                bot.edit_message_text(f"Bestätigen:\nSymbol {st['symbol']}\nCond {st['cond']}\nTF {st['tf']}", call.message.chat.id, call.message.message_id, reply_markup=kb_market_wizard(st))
+        else:
+            bot.answer_callback_query(call.id, "Unbekannte Aktion.")
     finally:
         db.close()
 
-def _trader_set_price_prompt(db, call, u: User):
-    t = _get_trader(db, u.id)
-    if not t or not t.is_approved:
-        bot.answer_callback_query(call.id, "Nur freigeschaltete Trader."); return
-    bot.edit_message_text("Sende neuen Wochenpreis als Zahl, z.B. <code>/setprice 25</code>",
-                          call.message.chat.id, call.message.message_id)
-
-@bot.message_handler(commands=["setprice"])
-def cmd_setprice(message: Message):
-    u = ensure_user(message)
-    db = get_session()
+# place bet buttons
+@bot.callback_query_handler(func=lambda c: c.data.startswith("mkb:"))
+def on_mkb(call: CallbackQuery):
+    db = db_sess()
     try:
-        t = _get_trader(db, u.id)
-        if not t or not t.is_approved:
-            bot.reply_to(message, "Nur freigeschaltete Trader."); return
-        parts = message.text.split()
-        if len(parts)!=2:
-            bot.reply_to(message, "Usage: /setprice <betrag_usdc>"); return
-        try:
-            val = float(parts[1]); assert val>0
-        except:
-            bot.reply_to(message, "Zahl >0 angeben."); return
-        t.weekly_price_usdc = val; db.commit()
-        bot.reply_to(message, f"Preis gesetzt: {val:.2f} USDC/Woche ✅")
+        _, side, mid, amt = call.data.split(":")
+        mid = int(mid)
+        m = db.query(Market).get(mid)
+        if not m:
+            bot.answer_callback_query(call.id, "Markt nicht gefunden."); return
+        now = now_utc()
+        if m.status!="open" or m.lock_at<=now:
+            bot.answer_callback_query(call.id, "Markt ist gesperrt."); return
+        u = db.query(User).filter(User.telegram_id==str(call.from_user.id)).first()
+        if not u:
+            bot.answer_callback_query(call.id, "Bitte /start nutzen."); return
+        amt_f = -1.0 if amt=="ALL" else float(amt)
+        bal = get_balance(db, u.id, "USDC")
+        stake = bal if amt_f<0 else amt_f
+        if stake<=0 or bal<stake:
+            bot.answer_callback_query(call.id, "Zu wenig Guthaben."); return
+        upsert_balance(db, u.id, "USDC", -stake)
+        b = Bet(market_id=mid, user_id=u.id, side=side.upper(), stake=stake, fee=0.0, payout=0.0, settled=False)
+        db.add(b); db.commit()
+        bot.answer_callback_query(call.id, f"{side.upper()} gesetzt: {stake:.2f} USDC")
+        # refresh view
+        txt = (f"#{m.id} <b>{m.symbol}</b> {m.condition}\n"
+               f"Ref: {m.reference_price:.6f}\nLock: {m.lock_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
+               f"Settle: {m.settle_at.strftime('%Y-%m-%d %H:%M UTC')}\nStatus: {m.status}\nFinal: {m.settle_price:.6f}")
+        can_bet = (m.status=="open") and (m.lock_at>now)
+        bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=kb_market_view(m, can_bet))
     finally:
         db.close()
 
-def _admin_balance_prompt(db, call, u: User):
-    bot.edit_message_text("Antworte:\n<code>/credit TELEGRAM_ID AMOUNT</code>\n<code>/debit TELEGRAM_ID AMOUNT</code>",
-                          call.message.chat.id, call.message.message_id, reply_markup=admin_menu_kbd())
-
-@bot.message_handler(commands=["credit"])
-def cmd_credit(message: Message):
-    if not is_admin(message.from_user.id): return
-    parts = message.text.split()
-    if len(parts)!=3: bot.reply_to(message, "Usage: /credit TELEGRAM_ID AMOUNT"); return
-    _, tid, amt = parts
-    try: amt = float(amt); assert amt>=0
-    except: bot.reply_to(message, "Betrag ungültig."); return
-    db = get_session()
-    try:
-        u = db.query(User).filter(User.telegram_id==tid).first()
-        if not u: bot.reply_to(message, "User nicht gefunden"); return
-        upsert_balance(db, u.id, "USDC", amt)
-        bot.reply_to(message, f"Gutschrift: {amt:.2f} USDC an {tid}")
-    finally:
-        db.close()
-
-@bot.message_handler(commands=["debit"])
-def cmd_debit(message: Message):
-    if not is_admin(message.from_user.id): return
-    parts = message.text.split()
-    if len(parts)!=3: bot.reply_to(message, "Usage: /debit TELEGRAM_ID AMOUNT"); return
-    _, tid, amt = parts
-    try: amt = float(amt); assert amt>=0
-    except: bot.reply_to(message, "Betrag ungültig."); return
-    db = get_session()
-    try:
-        u = db.query(User).filter(User.telegram_id==tid).first()
-        if not u: bot.reply_to(message, "User nicht gefunden"); return
-        upsert_balance(db, u.id, "USDC", -amt)
-        bot.reply_to(message, f"Belastung: {amt:.2f} USDC von {tid}")
-    finally:
-        db.close()
-
-def _admin_list_markets(db, call, u: User):
-    ms = db.query(Market).order_by(Market.id.desc()).limit(20).all()
-    if not ms:
-        bot.edit_message_text("Keine Märkte.", call.message.chat.id, call.message.message_id, reply_markup=admin_menu_kbd()); return
-    lines = ["<b>Märkte</b>"]
-    for m in ms:
-        lines.append(f"#{m.id} {m.symbol} {m.condition} | {m.status} | Ref:{m.reference_price:.6f} Settle:{m.settle_price:.6f}")
-    bot.edit_message_text("\n".join(lines), call.message.chat.id, call.message.message_id, reply_markup=admin_menu_kbd())
-
-def _admin_lock_prompt(db, call, u: User):
-    bot.edit_message_text("Lock per Command:\n<code>/lock MARKET_ID</code>", call.message.chat.id, call.message.message_id, reply_markup=admin_menu_kbd())
-
-@bot.message_handler(commands=["lock"])
-def cmd_lock(message: Message):
-    if not is_admin(message.from_user.id): return
-    parts = message.text.split()
-    if len(parts)!=2 or not parts[1].isdigit(): bot.reply_to(message, "Usage: /lock MARKET_ID"); return
-    mid = int(parts[1])
-    db = get_session()
-    try:
-        m = db.query(Market).filter(Market.id==mid).first()
-        if not m: bot.reply_to(message, "Market nicht gefunden"); return
-        m.status="locked"; m.lock_at=now_utc(); db.commit()
-        bot.reply_to(message, "Locked.")
-    finally:
-        db.close()
-
-def _admin_settle_prompt(db, call, u: User):
-    bot.edit_message_text("Settle per Command:\n<code>/settle MARKET_ID</code>", call.message.chat.id, call.message.message_id, reply_markup=admin_menu_kbd())
-
-@bot.message_handler(commands=["settle"])
-def cmd_settle(message: Message):
-    if not is_admin(message.from_user.id): return
-    parts = message.text.split()
-    if len(parts)!=2 or not parts[1].isdigit(): bot.reply_to(message, "Usage: /settle MARKET_ID"); return
-    mid = int(parts[1])
-    db = get_session()
-    try:
-        m = db.query(Market).filter(Market.id==mid).first()
-        if not m: bot.reply_to(message, "Market nicht gefunden"); return
-        m.settle_at = now_utc() - timedelta(seconds=1); db.commit()
-        # sofort Job ausführen
-        settle_markets_job()
-        bot.reply_to(message, "Settled.")
-    finally:
-        db.close()
-
-# ========= Run =========
+# ========= RUN =========
 if __name__ == "__main__":
     print("PulsePlay bot starting...")
     try:
         bot.infinity_polling(timeout=60, long_polling_timeout=60)
     finally:
-        try: scheduler.shutdown(wait=False)
-        except: pass
+        try:
+            scheduler.shutdown(wait=False)
+        except:
+            pass
