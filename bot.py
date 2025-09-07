@@ -1,16 +1,30 @@
-#!/usr/bin/env python3
+usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-PulsePlay – Full Inline Telegram Bot (Single file)
-Features:
-- Inline-only UI (no slash commands for users)
-- Copy Signals: follow Solana wallets, live trade pings (RPC)
-- Markets (YES/NO): create/lock/settle with automatic payouts
-- Balance: USDC, deposit via Solana RPC verify to central address, withdraw request
-- Coinflip game: 30% win chance, payout multiplier configurable
-- Admin Panel via buttons
+PulsePlay – Full Inline Bot (ALL FEATURES)
+- Inline-only UI (no slash commands needed for users)
+- Signals marketplace
+  • Wallet categories: memecoin / futures / other
+  • Weekly subscription price per wallet
+  • Subscribers receive trade signals (with source wallet + category shown)
+- Markets (prediction bets)
+  • Create markets (+% or above:PRICE), reference price, lock & settle time
+  • Detail view shows timers, price ref, and inline betting (YES/NO, +1/+5/+10 or custom)
+  • Settlement redistributes pools with house fee
+- Coinflip
+  • 30% win prob (hidden), x2 payout on win
+  • Flow works side-first or amount-first (preset or custom)
+- Balance
+  • USDC / SOL display, deposit (verify via Solana RPC to central address), withdraw request
+- Admin
+  • Wallet add/edit (title, category, weekly price), delete
+  • Market presets + custom
+  • Credit/Debit balances
 Dependencies:
-  pip install pyTelegramBotAPI SQLAlchemy requests APScheduler
+  pyTelegramBotAPI>=4.14.0
+  SQLAlchemy>=2.0.36  (Python 3.13 compatible)
+  APScheduler==3.10.4
+  requests==2.31.0
 """
 
 import os, json, threading, random
@@ -23,31 +37,33 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, C
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 from sqlalchemy import (create_engine, Column, Integer, String, DateTime, Boolean,
-                        ForeignKey, Float, Text, UniqueConstraint)
-from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session
+                        ForeignKey, Float, Text, UniqueConstraint, Index)
+from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session, relationship
 
 # ========= CONFIG =========
-BOT_TOKEN = "8200746289:AAGbzwf7sUHVHlLDb3foXbZpj9SVGnqLeNU"   # your token
-ADMIN_IDS = [7919108078]                                       # your Telegram user id(s)
-CENTRAL_DEPOSIT_ADDRESS = "CKZEpwiVqAHLiSbdc8Ebf8xaQ2fofgPCNmzi4cV32M1s"  # central Solana address
-SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+BOT_TOKEN = os.getenv("ENV_BOT_TOKEN", "8200746289:AAGbzwf7sUHVHlLDb3foXbZpj9SVGnqLeNU")
+ADMIN_IDS = [int(x) for x in os.getenv("7919108078", "").split(",") if x.strip()]
+CENTRAL_DEPOSIT_ADDRESS = os.getenv("ENV_CENTRAL_DEPOSIT_ADDRESS", "CKZEpwiVqAHLiSbdc8Ebf8xaQ2fofgPCNmzi4cV32M1s")
+SOLANA_RPC_URL = os.getenv("ENV_SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 USDC_SOLANA_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 
-DEFAULT_FEE_PCT = 0.04  # 4% fee on losing pool (markets)
-COINFLIP_WIN_PROB = 0.30
-COINFLIP_PAYOUT_MULT = 3.0
-DEBUG = True
+DEFAULT_FEE_PCT = float(os.getenv("ENV_DEFAULT_FEE_PCT", "0.04"))  # 4%
+COINFLIP_WIN_PROB = float(os.getenv("ENV_COINFLIP_PROB", "0.30"))  # 30% win probability (hidden)
+COINFLIP_PAYOUT_MULT = float(os.getenv("ENV_COINFLIP_MULT", "2.0"))  # X2 payout on win
+DEBUG = os.getenv("ENV_DEBUG", "1") == "1"
 
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="HTML")
 
 # ========= DB =========
 Base = declarative_base()
-engine = create_engine("sqlite:///pulseplay_full.db", connect_args={"check_same_thread": False})
+engine = create_engine("sqlite:///pulseplay_all.db", connect_args={"check_same_thread": False})
 SessionLocal = scoped_session(sessionmaker(bind=engine, autocommit=False, autoflush=False))
 
 def now_utc(): return datetime.now(timezone.utc)
+def esc(x:str)->str: return x.replace("<","&lt;").replace(">","&gt;")
 def dbg(x):
-    if DEBUG: print(f"[{datetime.utcnow().isoformat()}] {x}")
+    if DEBUG:
+        print(f"[{datetime.utcnow().isoformat()}] {x}")
 
 # ========= MODELS =========
 class User(Base):
@@ -64,17 +80,22 @@ class Wallet(Base):
     chain = Column(String, default="solana")
     address = Column(String, index=True)
     title = Column(String, default="")
+    category = Column(String, default="other")  # memecoin / futures / other
+    weekly_price = Column(Float, default=0.0)   # USDC per 7 days
+    owner_user_id = Column(Integer, ForeignKey("users.id"), nullable=True)
     is_public = Column(Boolean, default=True)
     active = Column(Boolean, default=True)
     last_sig = Column(String, nullable=True)
     __table_args__ = (UniqueConstraint("chain", "address", name="uq_chain_address"),)
 
-class Follow(Base):
-    __tablename__ = "follows"
+class Subscription(Base):
+    __tablename__ = "subscriptions"
     id = Column(Integer, primary_key=True)
     user_id = Column(Integer, ForeignKey("users.id"), index=True)
     wallet_id = Column(Integer, ForeignKey("wallets.id"), index=True)
-    __table_args__ = (UniqueConstraint("user_id", "wallet_id", name="uq_user_wallet"),)
+    expires_at = Column(DateTime, index=True)
+    active = Column(Boolean, default=True)
+    __table_args__ = (UniqueConstraint("user_id", "wallet_id", name="uq_user_wallet_sub"),)
 
 class Signal(Base):
     __tablename__ = "signals"
@@ -86,13 +107,14 @@ class Signal(Base):
     amount = Column(Float, default=0.0)
     price_usd = Column(Float, default=0.0)
     ts = Column(DateTime, default=datetime.utcnow)
+    Index("ix_wallet_tx", wallet_id, tx_sig)
 
 class Market(Base):
     __tablename__ = "markets"
     id = Column(Integer, primary_key=True)
     symbol = Column(String)
-    condition = Column(String)  # "+10%" or "above:0.00000123"
-    timeframe = Column(String, default="1h")
+    condition = Column(String)  # "+2%" | "above:0.25"
+    timeframe = Column(String, default="4h")  # 1h/4h/24h
     start_at = Column(DateTime)
     lock_at = Column(DateTime)
     settle_at = Column(DateTime)
@@ -107,7 +129,6 @@ class Bet(Base):
     user_id = Column(Integer, ForeignKey("users.id"), index=True)
     side = Column(String)  # YES/NO
     stake = Column(Float, default=0.0)
-    fee = Column(Float, default=0.0)
     payout = Column(Float, default=0.0)
     settled = Column(Boolean, default=False)
     placed_at = Column(DateTime, default=datetime.utcnow)
@@ -144,13 +165,13 @@ def get_state(uid): return STATE.get(uid)
 def get_session(): return SessionLocal()
 def is_admin(tid:int)->bool: return tid in ADMIN_IDS
 
-def ensure_user(msg_or_call)->User:
+def ensure_user(obj)->User:
     db=get_session()
     try:
-        if isinstance(msg_or_call, Message):
-            tid=str(msg_or_call.from_user.id); username=msg_or_call.from_user.username or ""
+        if isinstance(obj, Message):
+            tid=str(obj.from_user.id); username=obj.from_user.username or ""
         else:
-            tid=str(msg_or_call.from_user.id); username=msg_or_call.from_user.username or ""
+            tid=str(obj.from_user.id); username=obj.from_user.username or ""
         u=db.query(User).filter(User.telegram_id==tid).first()
         if not u:
             u=User(telegram_id=tid, username=username, role=("admin" if is_admin(int(tid)) else "user"))
@@ -171,6 +192,10 @@ def upsert_balance(db, user_id:int, currency:str, delta:float):
 def get_balance(db, user_id:int, currency:str="USDC")->float:
     bal = db.query(Balance).filter(Balance.user_id==user_id, Balance.currency==currency).first()
     return bal.amount if bal else 0.0
+
+def sub_active(db, user_id:int, wallet_id:int)->bool:
+    sub = db.query(Subscription).filter(Subscription.user_id==user_id, Subscription.wallet_id==wallet_id, Subscription.active==True).first()
+    return bool(sub and sub.expires_at and sub.expires_at > now_utc())
 
 # ========= PRICES =========
 def cg_price(symbol:str)->Optional[float]:
@@ -229,6 +254,16 @@ def get_account_keys(tx_json:dict)->List[str]:
 # ========= SIGNALS POLLER =========
 POLL_LOCK=threading.Lock()
 
+def notify_subscribers(db, w:Wallet, text:str):
+    subs=db.query(Subscription).filter(Subscription.wallet_id==w.id, Subscription.active==True).all()
+    for s in subs:
+        if s.expires_at and s.expires_at>now_utc():
+            try:
+                chat_id=int(db.query(User).get(s.user_id).telegram_id)
+                bot.send_message(chat_id, text)
+            except Exception as e:
+                dbg(f"notify error: {e}")
+
 def poll_wallet_once(db, w:Wallet):
     try:
         sigs=get_sigs_for_address(w.address, limit=20)
@@ -248,15 +283,13 @@ def poll_wallet_once(db, w:Wallet):
                 amt=float(t["amount"]); side="buy" if amt>0 else "sell"
                 p=get_price("SOL" if token=="SOL" else "USDC"); price=p if p is not None else price
             db.add(Signal(wallet_id=w.id, tx_sig=sig, side=side, token=token, amount=amt, price_usd=price, ts=now_utc())); db.commit()
-            followers=db.query(Follow).filter(Follow.wallet_id==w.id).all()
-            text=(f"📣 <b>Signal</b>\nWallet: <code>{w.address[:6]}…{w.address[-4:]}</code>\n"
-                  f"Action: <b>{side.upper()}</b>\nToken: <b>{token}</b>\nAmount: <b>{amt:.6f}</b>\n"
-                  f"Price: <b>${price:.6f}</b>\nTX: <code>{sig[:8]}…{sig[-6:]}</code>")
-            for f in followers:
-                try:
-                    chat=int(db.query(User).get(f.user_id).telegram_id)
-                    bot.send_message(chat, text)
-                except Exception as e: dbg(f"send follower msg err: {e}")
+            text=(f"📣 <b>Signal</b> — <i>{w.category}</i>\n"
+                  f"From: <b>{esc(w.title or 'Trader')}</b> (#{w.id})\n"
+                  f"Wallet: <code>{w.address[:6]}…{w.address[-4:]}</code>\n"
+                  f"Action: <b>{side.upper()}</b>  Token: <b>{token}</b>\n"
+                  f"Amount: <b>{amt:.6f}</b>  Price: <b>${price:.6f}</b>\n"
+                  f"TX: <code>{sig[:8]}…{sig[-6:]}</code>")
+            notify_subscribers(db, w, text)
         w.last_sig=sigs[0]["signature"]; db.commit()
     except Exception as e:
         dbg(f"poll wallet err: {e}")
@@ -271,6 +304,21 @@ def poll_all_wallets():
             db.close()
 
 # ========= MARKETS / SETTLEMENT =========
+def parse_condition(cond:str, ref:float, final:float)->bool:
+    cond=cond.strip()
+    if cond.endswith("%"):
+        try:
+            pct=float(cond.strip("%").strip())
+            if ref>0:
+                change=((final-ref)/ref)*100.0
+                return change>=pct
+        except: return False
+    if cond.startswith("above:"):
+        try:
+            thr=float(cond.split(":",1)[1]); return final>=thr
+        except: return False
+    return False
+
 def lock_and_settle_markets():
     db=get_session()
     try:
@@ -282,19 +330,7 @@ def lock_and_settle_markets():
         for m in db.query(Market).filter(Market.status=="locked", Market.settle_at<=now).all():
             final=get_price(m.symbol) or 0.0
             m.settle_price=final
-            win_yes=False
-            cond=m.condition.strip()
-            if cond.endswith("%"):
-                try:
-                    pct=float(cond.strip("%").strip())
-                    if m.reference_price>0:
-                        change=((final-m.reference_price)/m.reference_price)*100.0
-                        win_yes = change>=pct
-                except: pass
-            elif cond.startswith("above:"):
-                try:
-                    thr=float(cond.split(":",1)[1]); win_yes = final>=thr
-                except: pass
+            win_yes=parse_condition(m.condition, m.reference_price, final)
             yes=db.query(Bet).filter(Bet.market_id==m.id, Bet.side=="YES").all()
             no =db.query(Bet).filter(Bet.market_id==m.id, Bet.side=="NO").all()
             pool_yes=sum(b.stake for b in yes); pool_no=sum(b.stake for b in no)
@@ -324,14 +360,14 @@ scheduler.add_job(lock_and_settle_markets, IntervalTrigger(seconds=30), id="sett
 scheduler.start()
 
 # ========= UI =========
-def menu_kb(uid:int):
+def menu(uid:int):
     kb=InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("📈 Copy Signals", callback_data="copy"),
-           InlineKeyboardButton("🎲 Markets", callback_data="bets"))
-    kb.add(InlineKeyboardButton("🥇 Coinflip 30%", callback_data="cf"))
-    kb.add(InlineKeyboardButton("💰 Balance", callback_data="balance"),
+    kb.add(InlineKeyboardButton("📈 Signals", callback_data="sig"),
+           InlineKeyboardButton("🎲 Markets", callback_data="mkt"))
+    kb.add(InlineKeyboardButton("🥇 Coinflip", callback_data="cf"))
+    kb.add(InlineKeyboardButton("💰 Balance", callback_data="bal"),
            InlineKeyboardButton("ℹ️ Help", callback_data="help"))
-    if is_admin(uid): kb.add(InlineKeyboardButton("🛠 Admin", callback_data="admin"))
+    if is_admin(uid): kb.add(InlineKeyboardButton("🛠 Admin", callback_data="adm"))
     return kb
 
 def header(uid:int)->str:
@@ -340,19 +376,19 @@ def header(uid:int)->str:
         u=db.query(User).filter(User.telegram_id==str(uid)).first()
         if not u: return "👋 <b>PulsePlay</b>"
         usdc=get_balance(db,u.id,"USDC"); sol=get_balance(db,u.id,"SOL")
-        fcount=db.query(Follow).filter(Follow.user_id==u.id).count()
+        sub_count=db.query(Subscription).filter(Subscription.user_id==u.id, Subscription.active==True, Subscription.expires_at>now_utc()).count()
         open_mk=db.query(Market).filter(Market.status=="open").count()
         return (f"👋 <b>PulsePlay</b>\n"
-                f"User: @{u.username or uid}\n"
+                f"User: @{esc(u.username) if u.username else uid}\n"
                 f"Balance: <b>{usdc:.2f} USDC</b> | {sol:.4f} SOL\n"
-                f"Following: {fcount} | Open markets: {open_mk}")
+                f"Subscriptions: {sub_count} | Open markets: {open_mk}")
     finally:
         db.close()
 
 @bot.message_handler(commands=["start"])
-def on_start(message: Message):
-    ensure_user(message)
-    bot.send_message(message.chat.id, header(message.from_user.id), reply_markup=menu_kb(message.from_user.id))
+def on_start(msg: Message):
+    ensure_user(msg)
+    bot.send_message(msg.chat.id, header(msg.from_user.id), reply_markup=menu(msg.from_user.id))
 
 @bot.callback_query_handler(func=lambda c: True)
 def on_cb(call: CallbackQuery):
@@ -363,301 +399,424 @@ def on_cb(call: CallbackQuery):
         if not u:
             u=User(telegram_id=str(uid), username=call.from_user.username or "", role=("admin" if is_admin(uid) else "user"))
             db.add(u); db.commit()
+        d=call.data
 
-        data=call.data
+        # ===== Main nav =====
+        if d=="menu":
+            bot.edit_message_text(header(uid), call.message.chat.id, call.message.message_id, reply_markup=menu(uid))
 
-        # ===== Main =====
-        if data=="menu":
-            bot.edit_message_text(header(uid), call.message.chat.id, call.message.message_id, reply_markup=menu_kb(uid))
+        elif d=="help":
+            kb=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="menu"))
+            bot.edit_message_text(esc("• Signals: subscribe per wallet per week\n• Markets: bet YES/NO on +% or above:price\n• Coinflip: simple x2 style game\n• Balance: deposit/withdraw via Solana"),
+                                  call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-        elif data=="help":
-            bot.edit_message_text("ℹ️ Help\n• Buttons only.\n• Deposit to central address, then Verify.\n• Coinflip: 30% win, x3 payout.\n• Admin panel for management.",
-                                  call.message.chat.id, call.message.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="menu")))
-
-        # ===== Copy Signals =====
-        elif data=="copy":
-            ws=db.query(Wallet).filter(Wallet.is_public==True, Wallet.active==True).order_by(Wallet.id.asc()).all()
-            text="📈 <b>Trader Wallets</b>\n"
+        # ===== Signals Marketplace =====
+        elif d=="sig":
             kb=InlineKeyboardMarkup()
-            if not ws: text+="No wallets yet."
-            else:
-                for w in ws[:8]:
-                    kb.add(InlineKeyboardButton(f"#{w.id} {w.title or 'Trader'}", callback_data=f"w_view:{w.id}"))
-            if is_admin(uid): kb.add(InlineKeyboardButton("➕ Add Wallet", callback_data="w_add"))
+            kb.add(InlineKeyboardButton("📊 All", callback_data="sig_cat:all"),
+                   InlineKeyboardButton("🐶 Memecoin", callback_data="sig_cat:memecoin"),
+                   InlineKeyboardButton("📈 Futures", callback_data="sig_cat:futures"))
             kb.add(InlineKeyboardButton("🔙 Back", callback_data="menu"))
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
+            bot.edit_message_text("<b>Signals Marketplace</b>\nChoose a category:", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-        elif data.startswith("w_view:"):
-            wid=int(data.split(":")[1]); w=db.query(Wallet).get(wid)
-            if not w: bot.answer_callback_query(call.id,"Not found"); return
-            is_follow=db.query(Follow).filter(Follow.user_id==u.id, Follow.wallet_id==w.id).first() is not None
-            text=f"👛 <b>Wallet #{w.id}</b>\nAddress: <code>{w.address}</code>\nTitle: {w.title or '-'}"
+        elif d.startswith("sig_cat:"):
+            cat=d.split(":")[1]
+            q=db.query(Wallet).filter(Wallet.active==True, Wallet.is_public==True)
+            if cat!="all": q=q.filter(Wallet.category==cat)
+            ws=q.order_by(Wallet.id.asc()).all()
             kb=InlineKeyboardMarkup()
-            if is_follow: kb.add(InlineKeyboardButton("🔕 Unfollow", callback_data=f"w_unf:{w.id}"))
-            else: kb.add(InlineKeyboardButton("🔔 Follow", callback_data=f"w_f:{w.id}"))
+            txt=f"📂 <b>{cat.title()}</b> wallets\n"
+            if not ws: txt+="No wallets."
+            else:
+                for w in ws[:10]:
+                    price=f"{w.weekly_price:.2f} USDC/wk" if w.weekly_price>0 else "Free"
+                    kb.add(InlineKeyboardButton(f"#{w.id} {w.title or 'Trader'} • {price}", callback_data=f"w:{w.id}"))
+            kb.add(InlineKeyboardButton("🔙 Categories", callback_data="sig"))
+            bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+        elif d.startswith("w:"):
+            wid=int(d.split(":")[1]); w=db.query(Wallet).get(wid)
+            if not w: bot.answer_callback_query(call.id,"Not found"); return
+            active=sub_active(db,u.id,w.id)
+            price=f"{w.weekly_price:.2f} USDC/wk" if w.weekly_price>0 else "Free"
+            exp_text="Active" if active else "Not subscribed"
+            kb=InlineKeyboardMarkup()
+            if active:
+                sub=db.query(Subscription).filter(Subscription.user_id==u.id, Subscription.wallet_id==w.id).first()
+                left = max(0, int((sub.expires_at - now_utc()).total_seconds()//86400)) if sub and sub.expires_at else 0
+                kb.add(InlineKeyboardButton(f"✅ Active ({left}d left) – Renew 7d ({price})", callback_data=f"sub_buy:{w.id}"))
+                kb.add(InlineKeyboardButton("🔕 Unsubscribe", callback_data=f"sub_off:{w.id}"))
+            else:
+                kb.add(InlineKeyboardButton(f"🔔 Subscribe 7d ({price})", callback_data=f"sub_buy:{w.id}"))
+            kb.add(InlineKeyboardButton("🔙 Back", callback_data=f"sig_cat:{w.category if w.category in ('memecoin','futures') else 'all'}"))
+            txt=(f"👛 <b>Wallet #{w.id}</b>\n"
+                 f"Title: <b>{esc(w.title or 'Trader')}</b>\n"
+                 f"Category: <i>{w.category}</i>\n"
+                 f"Address: <code>{w.address}</code>\n"
+                 f"Subscription: {exp_text}\n"
+                 f"Price: {price}")
             if is_admin(uid):
-                kb.add(InlineKeyboardButton("✏️ Title", callback_data=f"w_edit:{w.id}"),
+                kb.add(InlineKeyboardButton("✏️ Title", callback_data=f"w_edit_title:{w.id}"),
+                       InlineKeyboardButton("🏷 Price", callback_data=f"w_edit_price:{w.id}"))
+                kb.add(InlineKeyboardButton("🗂 Category", callback_data=f"w_edit_cat:{w.id}"),
                        InlineKeyboardButton("🗑 Remove", callback_data=f"w_del:{w.id}"))
-            kb.add(InlineKeyboardButton("🔙 Back", callback_data="copy"))
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
+            bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-        elif data.startswith("w_f:"):
-            wid=int(data.split(":")[1])
-            try: db.add(Follow(user_id=u.id, wallet_id=wid)); db.commit(); bot.answer_callback_query(call.id,"Following ✅")
-            except: bot.answer_callback_query(call.id,"Already following")
+        elif d.startswith("sub_buy:"):
+            wid=int(d.split(":")[1]); w=db.query(Wallet).get(wid)
+            if not w: bot.answer_callback_query(call.id,"Not found"); return
+            cost=max(0.0, w.weekly_price)
+            bal=get_balance(db,u.id,"USDC")
+            if bal < cost:
+                bot.answer_callback_query(call.id, f"Need {cost:.2f} USDC")
+                return
+            upsert_balance(db,u.id,"USDC",-cost)
+            sub=db.query(Subscription).filter(Subscription.user_id==u.id, Subscription.wallet_id==w.id).first()
+            base=now_utc()
+            if sub and sub.active and sub.expires_at and sub.expires_at>base:
+                sub.expires_at = sub.expires_at + timedelta(days=7)
+            else:
+                if not sub:
+                    sub=Subscription(user_id=u.id, wallet_id=w.id, active=True, expires_at=base+timedelta(days=7))
+                    db.add(sub)
+                else:
+                    sub.active=True; sub.expires_at=base+timedelta(days=7)
+            db.commit()
+            bot.answer_callback_query(call.id,"Subscribed ✅")
 
-        elif data.startswith("w_unf:"):
-            wid=int(data.split(":")[1])
-            f=db.query(Follow).filter(Follow.user_id==u.id, Follow.wallet_id==wid).first()
-            if f: db.delete(f); db.commit(); bot.answer_callback_query(call.id,"Unfollowed ✅")
-            else: bot.answer_callback_query(call.id,"You don't follow")
+        elif d.startswith("sub_off:"):
+            wid=int(d.split(":")[1])
+            sub=db.query(Subscription).filter(Subscription.user_id==u.id, Subscription.wallet_id==wid).first()
+            if sub: sub.active=False; db.commit(); bot.answer_callback_query(call.id,"Unsubscribed ✅")
+            else: bot.answer_callback_query(call.id,"No subscription")
 
-        elif data=="w_add":
+        elif d.startswith("w_edit_title:"):
             if not is_admin(uid): bot.answer_callback_query(call.id,"Admins only"); return
-            set_state(uid,"add_wallet_addr",{})
-            bot.edit_message_text("➕ Add Wallet\nSend Solana address.", call.message.chat.id, call.message.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="copy")))
+            wid=int(d.split(":")[1]); set_state(uid,"w_title",{"wid":wid})
+            kb=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="sig"))
+            bot.edit_message_text("✏️ Send new title.", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-        elif data.startswith("w_edit:"):
+        elif d.startswith("w_edit_price:"):
             if not is_admin(uid): bot.answer_callback_query(call.id,"Admins only"); return
-            wid=int(data.split(":")[1]); set_state(uid,"edit_wallet_title",{"wid":wid})
-            bot.edit_message_text(f"✏️ Send new title for wallet #{wid}.", call.message.chat.id, call.message.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="copy")))
+            wid=int(d.split(":")[1]); set_state(uid,"w_price",{"wid":wid})
+            kb=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="sig"))
+            bot.edit_message_text("🏷 Send weekly price in USDC (e.g., 9.99).", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-        elif data.startswith("w_del:"):
+        elif d.startswith("w_edit_cat:"):
             if not is_admin(uid): bot.answer_callback_query(call.id,"Admins only"); return
-            wid=int(data.split(":")[1]); w=db.query(Wallet).get(wid)
+            wid=int(d.split(":")[1])
+            kb=InlineKeyboardMarkup()
+            for c in ("memecoin","futures","other"):
+                kb.add(InlineKeyboardButton(c.title(), callback_data=f"w_cat_set:{wid}:{c}"))
+            kb.add(InlineKeyboardButton("🔙 Back", callback_data="sig"))
+            bot.edit_message_text("🗂 Choose category:", call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+        elif d.startswith("w_cat_set:"):
+            if not is_admin(uid): bot.answer_callback_query(call.id,"Admins only"); return
+            _, wid, cat = d.split(":")
+            w=db.query(Wallet).get(int(wid));
+            if not w: bot.answer_callback_query(call.id,"Not found"); return
+            w.category=cat; db.commit(); bot.answer_callback_query(call.id,"Updated ✅")
+
+        elif d.startswith("w_del:"):
+            if not is_admin(uid): bot.answer_callback_query(call.id,"Admins only"); return
+            wid=int(d.split(":")[1]); w=db.query(Wallet).get(wid)
             if not w: bot.answer_callback_query(call.id,"Not found"); return
             db.delete(w); db.commit(); bot.answer_callback_query(call.id,"Removed ✅")
 
         # ===== Markets =====
-        elif data=="bets":
+        elif d=="mkt":
+            kb=InlineKeyboardMarkup()
             mk=db.query(Market).order_by(Market.lock_at.asc()).all()
-            text="🎲 <b>Markets</b>\n"
-            kb=InlineKeyboardMarkup()
-            if not mk: text+="No markets."
+            if not mk:
+                txt="🎲 No markets. "
             else:
-                for mkt in mk[:8]:
-                    kb.add(InlineKeyboardButton(f"#{mkt.id} {mkt.symbol} {mkt.condition} [{mkt.status}]", callback_data=f"m_view:{mkt.id}"))
-            if is_admin(uid): kb.add(InlineKeyboardButton("➕ New Market", callback_data="m_new"))
+                txt="🎲 <b>Markets</b>\n"
+                for m in mk[:10]:
+                    txt+=f"#{m.id} {m.symbol} {m.condition} [{m.status}]\n"
+                    kb.add(InlineKeyboardButton(f"View #{m.id}", callback_data=f"m:{m.id}"))
+            if is_admin(uid): kb.add(InlineKeyboardButton("➕ New", callback_data="m_new"))
             kb.add(InlineKeyboardButton("🔙 Back", callback_data="menu"))
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
+            bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-        elif data.startswith("m_view:"):
-            mid=int(data.split(":")[1]); mkt=db.query(Market).get(mid)
-            if not mkt: bot.answer_callback_query(call.id,"Not found"); return
-            text=(f"📊 <b>Market #{mkt.id}</b>\nSymbol: {mkt.symbol}\nCondition: {mkt.condition}\n"
-                  f"Status: {mkt.status}\nLock: {mkt.lock_at.strftime('%Y-%m-%d %H:%M UTC')}\n"
-                  f"Settle: {mkt.settle_at.strftime('%Y-%m-%d %H:%M UTC')}\nRef: {mkt.reference_price:.6f}\nFinal: {mkt.settle_price:.6f}")
+        elif d.startswith("m:"):
+            mid=int(d.split(":")[1]); m=db.query(Market).get(mid)
+            if not m: bot.answer_callback_query(call.id,"Not found"); return
+            ref=m.reference_price; now=now_utc()
+            left_lock=max(0, int((m.lock_at-now).total_seconds()))
+            left_settle=max(0, int((m.settle_at-now).total_seconds()))
+            txt=(f"📊 <b>Market #{m.id}</b>\n"
+                 f"Symbol: <b>{m.symbol}</b>\n"
+                 f"Condition: <code>{m.condition}</code>\n"
+                 f"Timeframe: {m.timeframe}\n"
+                 f"Ref price: {ref:.6f}\n"
+                 f"Lock in: {left_lock//60}m {left_lock%60}s | Settle in: {left_settle//60}m {left_settle%60}s\n"
+                 f"Status: {m.status}")
             kb=InlineKeyboardMarkup()
-            if mkt.status=="open" and mkt.lock_at>now_utc():
-                kb.add(InlineKeyboardButton("✅ YES +1", callback_data=f"m_bet:{mid}:YES"),
-                       InlineKeyboardButton("❌ NO +1", callback_data=f"m_bet:{mid}:NO"))
-                kb.add(InlineKeyboardButton("💵 Custom Stake", callback_data=f"m_custom:{mid}"))
+            if m.status=="open" and m.lock_at>now:
+                for a in (1,5,10):
+                    kb.add(InlineKeyboardButton(f"YES +{a}", callback_data=f"m_bet:{mid}:YES:{a}"),
+                           InlineKeyboardButton(f"NO +{a}", callback_data=f"m_bet:{mid}:NO:{a}"))
+                kb.add(InlineKeyboardButton("💵 Custom", callback_data=f"m_custom:{mid}"))
             if is_admin(uid):
-                if mkt.status=="open": kb.add(InlineKeyboardButton("🔒 Lock now", callback_data=f"m_lock:{mid}"))
-                if mkt.status in ("open","locked"): kb.add(InlineKeyboardButton("✅ Settle now", callback_data=f"m_settle:{mid}"))
+                if m.status=="open": kb.add(InlineKeyboardButton("🔒 Lock", callback_data=f"m_lock:{mid}"))
+                if m.status in ("open","locked"): kb.add(InlineKeyboardButton("✅ Settle", callback_data=f"m_settle:{mid}"))
                 kb.add(InlineKeyboardButton("🗑 Delete", callback_data=f"m_del:{mid}"))
-            kb.add(InlineKeyboardButton("🔙 Back", callback_data="bets"))
-            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, reply_markup=kb)
+            kb.add(InlineKeyboardButton("🔙 Back", callback_data="mkt"))
+            bot.edit_message_text(txt, call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-        elif data.startswith("m_bet:"):
-            mid, side = int(data.split(":")[1]), data.split(":")[2]
+        elif d.startswith("m_bet:"):
+            _, mid, side, amt = d.split(":")
+            mid=int(mid); amt=float(amt)
             mkt=db.query(Market).get(mid)
             if not mkt or mkt.status!="open" or mkt.lock_at<=now_utc(): bot.answer_callback_query(call.id,"Locked"); return
-            bal=get_balance(db,u.id,"USDC"); stake=1.0
-            if bal<stake: bot.answer_callback_query(call.id,f"Not enough balance ({bal:.2f})"); return
-            upsert_balance(db,u.id,"USDC",-stake)
-            db.add(Bet(market_id=mid, user_id=u.id, side=side, stake=stake)); db.commit()
-            bot.answer_callback_query(call.id, f"Bet {side} 1.00 USDC ✅")
+            bal=get_balance(db,u.id,"USDC")
+            if bal<amt: bot.answer_callback_query(call.id,f"Need {amt:.2f} USDC"); return
+            upsert_balance(db,u.id,"USDC",-amt)
+            db.add(Bet(market_id=mid, user_id=u.id, side=side, stake=amt)); db.commit()
+            bot.answer_callback_query(call.id, f"Bet {side} {amt:.2f} ✅")
 
-        elif data.startswith("m_custom:"):
-            mid=int(data.split(":")[1]); set_state(uid,"bet_amount",{"mid":mid})
-            bot.edit_message_text("💵 Send stake amount (USDC).", call.message.chat.id, call.message.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="bets")))
+        elif d.startswith("m_custom:"):
+            mid=int(d.split(":")[1]); set_state(uid,"bet_amt",{"mid":mid})
+            kb=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data=f"m:{mid}"))
+            bot.edit_message_text("💵 Send stake amount (USDC).", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-        elif data.startswith("m_lock:"):
+        elif d.startswith("m_lock:"):
             if not is_admin(uid): bot.answer_callback_query(call.id,"Admins only"); return
-            mid=int(data.split(":")[1]); mkt=db.query(Market).get(mid)
-            if not mkt: bot.answer_callback_query(call.id,"Not found"); return
-            mkt.status="locked"; mkt.lock_at=now_utc(); db.commit(); bot.answer_callback_query(call.id,"Locked ✅")
+            mid=int(d.split(":")[1]); m=db.query(Market).get(mid)
+            if not m: bot.answer_callback_query(call.id,"Not found"); return
+            m.status="locked"; m.lock_at=now_utc(); db.commit(); bot.answer_callback_query(call.id,"Locked ✅")
 
-        elif data.startswith("m_settle:"):
+        elif d.startswith("m_settle:"):
             if not is_admin(uid): bot.answer_callback_query(call.id,"Admins only"); return
-            mid=int(data.split(":")[1]); mkt=db.query(Market).get(mid)
-            if not mkt: bot.answer_callback_query(call.id,"Not found"); return
-            mkt.settle_at=now_utc()-timedelta(seconds=1); db.commit(); lock_and_settle_markets(); bot.answer_callback_query(call.id,"Settled ✅")
+            mid=int(d.split(":")[1]); m=db.query(Market).get(mid)
+            if not m: bot.answer_callback_query(call.id,"Not found"); return
+            m.settle_at=now_utc()-timedelta(seconds=1); db.commit(); lock_and_settle_markets(); bot.answer_callback_query(call.id,"Settled ✅")
 
-        elif data.startswith("m_del:"):
+        elif d.startswith("m_del:"):
             if not is_admin(uid): bot.answer_callback_query(call.id,"Admins only"); return
-            mid=int(data.split(":")[1]); mkt=db.query(Market).get(mid)
-            if not mkt: bot.answer_callback_query(call.id,"Not found"); return
-            db.delete(mkt); db.commit(); bot.answer_callback_query(call.id,"Deleted ✅")
+            mid=int(d.split(":")[1]); m=db.query(Market).get(mid)
+            if not m: bot.answer_callback_query(call.id,"Not found"); return
+            db.delete(m); db.commit(); bot.answer_callback_query(call.id,"Deleted ✅")
 
-        elif data=="m_new":
+        elif d=="m_new":
             if not is_admin(uid): bot.answer_callback_query(call.id,"Admins only"); return
-            set_state(uid,"new_market_symbol",{})
-            bot.edit_message_text("➕ New Market\nSend symbol (e.g., SOL).", call.message.chat.id, call.message.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="bets")))
+            kb=InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("+2% / 4h (SOL)", callback_data="m_new_preset:SOL:+2%:4h"))
+            kb.add(InlineKeyboardButton("+2% / 24h (SOL)", callback_data="m_new_preset:SOL:+2%:24h"))
+            kb.add(InlineKeyboardButton("above:100 / 24h (BTC)", callback_data="m_new_preset:BTC:above:100:24h"))
+            kb.add(InlineKeyboardButton("✏️ Custom", callback_data="m_new_custom"))
+            kb.add(InlineKeyboardButton("🔙 Back", callback_data="mkt"))
+            bot.edit_message_text("➕ New Market — choose a preset or Custom:", call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+        elif d.startswith("m_new_preset:"):
+            parts=d.split(":")
+            symbol=parts[1]
+            if parts[2].startswith("+"):
+                cond=parts[2]; tf=parts[3]
+            else:
+                cond=f"{parts[2]}:{parts[3]}"; tf=parts[4]
+            _create_market(db, symbol, cond, tf)
+            bot.answer_callback_query(call.id,"Market created ✅")
+
+        elif d=="m_new_custom":
+            set_state(uid,"new_m_symbol",{})
+            kb=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="mkt"))
+            bot.edit_message_text("Symbol? (e.g., SOL)", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
         # ===== Coinflip =====
-        elif data=="cf":
+        elif d=="cf":
             kb=InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("🌕 HEADS", callback_data="cf_side:HEADS"),
-                   InlineKeyboardButton("🌑 TAILS", callback_data="cf_side:TAILS"))
-            kb.add(InlineKeyboardButton("1 USDC", callback_data="cf_amt:1"),
-                   InlineKeyboardButton("5 USDC", callback_data="cf_amt:5"),
-                   InlineKeyboardButton("10 USDC", callback_data="cf_amt:10"))
+            kb.add(InlineKeyboardButton("🌕 Kopf", callback_data="cf_side:HEADS"),
+                   InlineKeyboardButton("🌑 Zahl", callback_data="cf_side:TAILS"))
+            for a in (1,5,10):
+                kb.add(InlineKeyboardButton(f"{a} USDC", callback_data=f"cf_amt:{a}"))
             kb.add(InlineKeyboardButton("💵 Custom", callback_data="cf_custom"))
             kb.add(InlineKeyboardButton("🔙 Back", callback_data="menu"))
-            bot.edit_message_text(f"🥇 <b>Coinflip</b>\nWin chance: {int(COINFLIP_WIN_PROB*100)}%\nPayout: x{COINFLIP_PAYOUT_MULT:.2f}\nChoose side & stake.",
-                                  call.message.chat.id, call.message.message_id, reply_markup=kb)
+            bot.edit_message_text("🥇 <b>Coinflip</b>\nWähle Seite und Einsatz.", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-        elif data.startswith("cf_side:"):
-            side=data.split(":")[1]
+        elif d.startswith("cf_side:"):
+            side=d.split(":")[1]
             st=get_state(uid) or {"ctx":{}}
             ctx=st.get("ctx",{}); ctx["cf_side"]=side
             set_state(uid, "cf_wait_amt", ctx)
-            bot.answer_callback_query(call.id, f"Side: {side}")
+            bot.answer_callback_query(call.id, f"Seite: {'Kopf' if side=='HEADS' else 'Zahl'}")
 
-        elif data.startswith("cf_amt:"):
-            amt=float(data.split(":")[1])
+        elif d.startswith("cf_amt:"):
+            amt=float(d.split(":")[1])
             st=get_state(uid) or {"ctx":{}}
-            side= (st.get("ctx") or {}).get("cf_side")
+            side=(st.get("ctx") or {}).get("cf_side")
             if not side:
-                set_state(uid, "cf_wait_side", {"cf_amt": amt})
-                bot.answer_callback_query(call.id, f"Stake: {amt} USDC — now choose HEADS/TAILS")
+                set_state(uid,"cf_wait_side",{"cf_amt":amt})
+                bot.answer_callback_query(call.id, f"Einsatz {amt:.2f} USDC – jetzt Kopf/Zahl wählen")
                 return
             _coinflip_play(db, u.id, call, side, amt)
 
-        elif data=="cf_custom":
+        elif d=="cf_custom":
             set_state(uid,"cf_custom_amt",{})
-            bot.edit_message_text("💵 Send custom stake (USDC).", call.message.chat.id, call.message.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="cf")))
+            kb=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="cf"))
+            bot.edit_message_text("Einsatz senden (USDC).", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
         # ===== Balance =====
-        elif data=="balance":
+        elif d=="bal":
             usdc=get_balance(db,u.id,"USDC"); sol=get_balance(db,u.id,"SOL")
             kb=InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("💸 Deposit", callback_data="dep"), InlineKeyboardButton("✅ Verify", callback_data="dep_verify"))
+            kb.add(InlineKeyboardButton("💸 Deposit", callback_data="dep"),
+                   InlineKeyboardButton("🔎 Verify", callback_data="dep_verify"))
             kb.add(InlineKeyboardButton("🏧 Withdraw", callback_data="wd"))
             kb.add(InlineKeyboardButton("🔙 Back", callback_data="menu"))
-            bot.edit_message_text(f"💰 <b>Balance</b>\nUSDC: {usdc:.2f}\nSOL: {sol:.4f}\n\nCentral address:\n<code>{CENTRAL_DEPOSIT_ADDRESS}</code>",
+            bot.edit_message_text(f"💰 <b>Balance</b>\nUSDC: {usdc:.2f}\nSOL: {sol:.4f}\n"
+                                  f"Central address:\n<code>{CENTRAL_DEPOSIT_ADDRESS}</code>",
                                   call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-        elif data=="dep":
-            set_state(uid,"deposit_amount",{})
-            bot.edit_message_text(f"💸 Deposit\n1) Send amount (USDC or SOL)\n2) Then send your Sender-Wallet\nTarget:\n<code>{CENTRAL_DEPOSIT_ADDRESS}</code>",
-                                  call.message.chat.id, call.message.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="balance")))
+        elif d=="dep":
+            set_state(uid,"dep_amt",{})
+            kb=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="bal"))
+            bot.edit_message_text("💸 Amount senden (USDC oder SOL) und danach Sender-Wallet.", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-        elif data=="dep_verify":
-            set_state(uid,"verify_payment",{})
-            bot.edit_message_text("🔎 Verify Deposit\nSend your Sender-Wallet.", call.message.chat.id, call.message.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="balance")))
+        elif d=="dep_verify":
+            set_state(uid,"dep_verify",{})
+            kb=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="bal"))
+            bot.edit_message_text("🔎 Sende deine Sender-Wallet für die Verifizierung.", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-        elif data=="wd":
-            set_state(uid,"withdraw_amount",{})
-            bot.edit_message_text("🏧 Withdraw\nSend the amount (USDC).", call.message.chat.id, call.message.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="balance")))
+        elif d=="wd":
+            set_state(uid,"wd_amt",{})
+            kb=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="bal"))
+            bot.edit_message_text("🏧 Sende den USDC-Betrag für die Auszahlung.", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
         # ===== Admin =====
-        elif data=="admin":
+        elif d=="adm":
             if not is_admin(uid): bot.answer_callback_query(call.id,"Admins only"); return
             kb=InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton("➕ Wallet", callback_data="w_add"),
-                   InlineKeyboardButton("➕ Market", callback_data="m_new"))
-            kb.add(InlineKeyboardButton("➕ Credit User", callback_data="adm_credit"),
-                   InlineKeyboardButton("➖ Debit User", callback_data="adm_debit"))
+            kb.add(InlineKeyboardButton("➕ Wallet", callback_data="adm_w_add"),
+                   InlineKeyboardButton("🗂 Edit Wallets", callback_data="sig"))
+            kb.add(InlineKeyboardButton("➕ Market", callback_data="m_new"))
+            kb.add(InlineKeyboardButton("💳 Credit", callback_data="adm_credit"),
+                   InlineKeyboardButton("💳 Debit", callback_data="adm_debit"))
             kb.add(InlineKeyboardButton("🔙 Back", callback_data="menu"))
             bot.edit_message_text("🛠 <b>Admin Panel</b>", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-        elif data=="adm_credit":
+        elif d=="adm_w_add":
             if not is_admin(uid): bot.answer_callback_query(call.id,"Admins only"); return
-            set_state(uid,"credit_user_id",{})
-            bot.edit_message_text("💳 Credit: send user Telegram-ID.", call.message.chat.id, call.message.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="admin")))
+            set_state(uid,"w_add_addr",{})
+            kb=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="adm"))
+            bot.edit_message_text("➕ Wallet: sende Solana-Adresse.", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
-        elif data=="adm_debit":
+        elif d=="adm_credit":
             if not is_admin(uid): bot.answer_callback_query(call.id,"Admins only"); return
-            set_state(uid,"debit_user_id",{})
-            bot.edit_message_text("💳 Debit: send user Telegram-ID.", call.message.chat.id, call.message.message_id, reply_markup=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="admin")))
+            set_state(uid,"credit_uid",{})
+            kb=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="adm"))
+            bot.edit_message_text("💳 Credit: sende Telegram-ID.", call.message.chat.id, call.message.message_id, reply_markup=kb)
+
+        elif d=="adm_debit":
+            if not is_admin(uid): bot.answer_callback_query(call.id,"Admins only"); return
+            set_state(uid,"debit_uid",{})
+            kb=InlineKeyboardMarkup().add(InlineKeyboardButton("🔙 Back", callback_data="adm"))
+            bot.edit_message_text("💳 Debit: sende Telegram-ID.", call.message.chat.id, call.message.message_id, reply_markup=kb)
 
         else:
-            bot.answer_callback_query(call.id,"Unknown")
+            bot.answer_callback_query(call.id,"…")
     finally:
         db.close()
+
+def _create_market(db, symbol:str, cond:str, tf:str):
+    ref=get_price(symbol) or 0.0
+    start=now_utc()
+    lock=start+timedelta(minutes=5)
+    hours={"1h":1,"4h":4,"24h":24}.get(tf,4)
+    settle=start+timedelta(hours=hours)
+    m=Market(symbol=symbol.upper(), condition=cond, timeframe=tf, start_at=start, lock_at=lock, settle_at=settle, status="open", reference_price=ref)
+    db.add(m); db.commit()
 
 def _coinflip_play(db, user_id:int, call:CallbackQuery, side:str, amt:float):
     u=db.query(User).filter(User.telegram_id==str(user_id)).first()
     bal=get_balance(db,u.id,"USDC")
-    if amt<=0: bot.answer_callback_query(call.id,"Stake > 0"); return
-    if bal<amt: bot.answer_callback_query(call.id,f"Not enough balance ({bal:.2f})"); return
+    if amt<=0: bot.answer_callback_query(call.id,"Einsatz > 0"); return
+    if bal<amt: bot.answer_callback_query(call.id,f"Balance {bal:.2f}"); return
     upsert_balance(db,u.id,"USDC",-amt)
     win = (random.random() < COINFLIP_WIN_PROB)
     outcome = side if win else ("TAILS" if side=="HEADS" else "HEADS")
     payout = round(amt*COINFLIP_PAYOUT_MULT, 6) if win else 0.0
     if win: upsert_balance(db,u.id,"USDC",payout)
-    bot.answer_callback_query(call.id, f"{'WIN 🎉' if win else 'LOSE 😵'} | Result: {outcome}")
     kb=InlineKeyboardMarkup()
-    kb.add(InlineKeyboardButton("Again", callback_data="cf"), InlineKeyboardButton("💰 Balance", callback_data="balance"), InlineKeyboardButton("🔙 Back", callback_data="menu"))
-    bot.edit_message_text(f"🥇 <b>Coinflip</b>\nYour side: {side} | Stake: {amt:.2f}\nResult: <b>{outcome}</b>\n{'Payout: +' + str(payout) + ' USDC' if win else 'Payout: 0.0 USDC'}",
+    kb.add(InlineKeyboardButton("🔁 Nochmal", callback_data="cf"), InlineKeyboardButton("💰 Balance", callback_data="bal"), InlineKeyboardButton("🏠 Menü", callback_data="menu"))
+    bot.answer_callback_query(call.id, "Ergebnis da.")
+    bot.edit_message_text(f"🥇 <b>Coinflip</b>\nSeite: {'Kopf' if side=='HEADS' else 'Zahl'} | Einsatz: {amt:.2f}\n"
+                          f"Result: <b>{'Kopf' if outcome=='HEADS' else 'Zahl'}</b>\n"
+                          f"{'Payout: +' + str(payout) + ' USDC' if win else 'Payout: 0.0 USDC'}",
                           call.message.chat.id, call.message.message_id, reply_markup=kb)
 
 @bot.message_handler(func=lambda m: True)
-def on_text(message: Message):
-    uid=message.from_user.id
+def on_text(msg: Message):
+    uid=msg.from_user.id
     st=get_state(uid)
     if not st:
-        if message.text.strip().lower() in ("/start","start"): return on_start(message)
+        if msg.text.strip().lower() in ("/start","start"): return on_start(msg)
         return
     name=st["name"]; ctx=st["ctx"]
     db=get_session()
     try:
         u=db.query(User).filter(User.telegram_id==str(uid)).first()
-        # Wallet add/edit
-        if name=="add_wallet_addr":
-            ctx["addr"]=message.text.strip(); set_state(uid,"add_wallet_title",ctx); bot.reply_to(message,"Send wallet title (or '-' for empty).")
-        elif name=="add_wallet_title":
-            addr=ctx["addr"]; title=message.text.strip(); title="" if title=="-" else title
-            w=Wallet(chain="solana", address=addr, title=title, is_public=True, active=True)
-            db.add(w); db.commit(); set_state(uid,None); bot.reply_to(message,f"✅ Wallet #{w.id} added.")
-        elif name=="edit_wallet_title":
+        # Admin add wallet flow
+        if name=="w_add_addr":
+            ctx["addr"]=msg.text.strip(); set_state(uid,"w_add_title",ctx); bot.reply_to(msg,"Titel senden.")
+        elif name=="w_add_title":
+            ctx["title"]=msg.text.strip(); set_state(uid,"w_add_cat",ctx)
+            kb=InlineKeyboardMarkup()
+            for c in ("memecoin","futures","other"):
+                kb.add(InlineKeyboardButton(c.title(), callback_data=f"w_add_cat:{c}"))
+            bot.reply_to(msg,"Kategorie wählen:", reply_markup=kb)
+        elif name=="w_add_price":
+            try: price=float(msg.text.strip())
+            except: bot.reply_to(msg,"Zahl senden."); return
+            addr=ctx["addr"]; title=ctx["title"]; cat=ctx["cat"]
+            w=Wallet(chain="solana", address=addr, title=title, category=cat, weekly_price=max(0.0,price), is_public=True, active=True, owner_user_id=u.id)
+            db.add(w); db.commit(); set_state(uid,None); bot.reply_to(msg, f"✅ Wallet #{w.id} erstellt.")
+        # helper for category (pressed button)
+        elif name=="w_title":
             wid=ctx["wid"]; w=db.query(Wallet).get(wid)
-            if not w: bot.reply_to(message,"Not found"); set_state(uid,None); return
-            w.title=message.text.strip(); db.commit(); set_state(uid,None); bot.reply_to(message,"✅ Title updated.")
-
-        # New market
-        elif name=="new_market_symbol":
-            sym=message.text.strip().upper(); ctx["sym"]=sym; set_state(uid,"new_market_cond",ctx); bot.reply_to(message,"Condition (e.g., +10% or above:0.5).")
-        elif name=="new_market_cond":
-            cond=message.text.strip(); ctx["cond"]=cond; set_state(uid,"new_market_tf",ctx); bot.reply_to(message,"Timeframe: 1h, 4h or 24h.")
-        elif name=="new_market_tf":
-            tf=message.text.strip()
-            if tf not in ("1h","4h","24h"): bot.reply_to(message,"Invalid."); return
-            sym=ctx["sym"]; cond=ctx["cond"]; ref=get_price(sym); start=now_utc()
-            lock=start+timedelta(minutes=5); settle=start+timedelta(hours={"1h":1,"4h":4,"24h":24}[tf])
-            m=Market(symbol=sym, condition=cond, timeframe=tf, start_at=start, lock_at=lock, settle_at=settle, status="open", reference_price=ref)
-            db.add(m); db.commit(); set_state(uid,None); bot.reply_to(message,f"✅ Market #{m.id} {sym} {cond} created.")
-
-        # Market bet custom
-        elif name=="bet_amount":
-            try: amt=float(message.text.strip())
-            except: bot.reply_to(message,"Send a number."); return
-            if amt<=0: bot.reply_to(message,"> 0"); return
+            if not w: set_state(uid,None); bot.reply_to(msg,"Not found"); return
+            w.title=msg.text.strip(); db.commit(); set_state(uid,None); bot.reply_to(msg,"Updated.")
+        elif name=="w_price":
+            wid=ctx["wid"]; w=db.query(Wallet).get(wid)
+            if not w: set_state(uid,None); bot.reply_to(msg,"Not found"); return
+            try: p=float(msg.text.strip())
+            except: bot.reply_to(msg,"Zahl senden."); return
+            w.weekly_price=max(0.0,p); db.commit(); set_state(uid,None); bot.reply_to(msg,"Updated.")
+        # New market (custom)
+        elif name=="new_m_symbol":
+            ctx["sym"]=msg.text.strip().upper(); set_state(uid,"new_m_cond",ctx); bot.reply_to(msg,"Condition (e.g., +2% or above:0.25).")
+        elif name=="new_m_cond":
+            ctx["cond"]=msg.text.strip(); set_state(uid,"new_m_tf",ctx); bot.reply_to(msg,"Timeframe: 1h, 4h, 24h.")
+        elif name=="new_m_tf":
+            tf=msg.text.strip()
+            if tf not in ("1h","4h","24h"): bot.reply_to(msg,"Ungültig."); return
+            _create_market(db, ctx["sym"], ctx["cond"], tf); set_state(uid,None); bot.reply_to(msg,"✅ Market erstellt.")
+        # Markets custom bet
+        elif name=="bet_amt":
+            try: amt=float(msg.text.strip())
+            except: bot.reply_to(msg,"Zahl senden."); return
+            if amt<=0: bot.reply_to(msg,"> 0"); return
             mid=ctx["mid"]; mkt=db.query(Market).get(mid)
-            if not mkt or mkt.status!="open" or mkt.lock_at<=now_utc(): set_state(uid,None); bot.reply_to(message,"Locked."); return
+            if not mkt or mkt.status!="open" or mkt.lock_at<=now_utc(): set_state(uid,None); bot.reply_to(msg,"Locked."); return
             bal=get_balance(db,u.id,"USDC")
-            if bal<amt: bot.reply_to(message,f"Not enough balance ({bal:.2f})"); return
-            upsert_balance(db,u.id,"USDC",-amt); db.add(Bet(market_id=mid, user_id=u.id, side="YES", stake=amt)); db.commit(); set_state(uid,None)
-            bot.reply_to(message,f"✅ Bet YES {amt:.2f} USDC")
-
-        # Deposit flow
-        elif name=="deposit_amount":
-            try: amt=float(message.text.strip())
-            except: bot.reply_to(message,"Send a number."); return
-            if amt<=0: bot.reply_to(message,"> 0"); return
-            ctx["amount"]=amt; set_state(uid,"deposit_sender",ctx)
-            bot.reply_to(message,f"Send your sender wallet now.\nTarget:\n<code>{CENTRAL_DEPOSIT_ADDRESS}</code>")
-        elif name=="deposit_sender":
-            sender=message.text.strip(); amt=ctx["amount"]
+            if bal<amt: bot.reply_to(msg,f"Need {amt:.2f}"); return
+            upsert_balance(db,u.id,"USDC",-amt); db.add(Bet(market_id=mid,user_id=u.id,side="YES",stake=amt)); db.commit(); set_state(uid,None)
+            bot.reply_to(msg,f"✅ Bet YES {amt:.2f}")
+        # Balance flows
+        elif name=="dep_amt":
+            try: amt=float(msg.text.strip())
+            except: bot.reply_to(msg,"Zahl senden."); return
+            if amt<=0: bot.reply_to(msg,"> 0"); return
+            ctx["amt"]=amt; set_state(uid,"dep_sender",ctx)
+            bot.reply_to(msg,f"Sender-Wallet senden.\nZiel:\n<code>{CENTRAL_DEPOSIT_ADDRESS}</code>")
+        elif name=="dep_sender":
+            sender=msg.text.strip(); amt=ctx["amt"]
             p=Payment(user_id=u.id, type="deposit", method="solana", amount=amt, status="pending", meta=json.dumps({"sender":sender}))
             db.add(p); db.commit(); set_state(uid,None)
-            bot.reply_to(message,f"✅ Deposit request #{p.id}. After sending funds: click Verify in Balance.")
-
-        elif name=="verify_payment":
-            sender=message.text.strip()
+            bot.reply_to(msg,f"✅ Deposit #{p.id}. Nach Senden → Verify drücken.")
+        elif name=="dep_verify":
+            sender=msg.text.strip()
             sigs=get_sigs_for_address(CENTRAL_DEPOSIT_ADDRESS, limit=40); matched=False
             for s in sigs:
                 sig=s["signature"]; tx=get_tx(sig)
@@ -669,67 +828,73 @@ def on_text(message: Message):
                     credit = inflow_usdc if inflow_usdc>0 else inflow_sol*(get_price("SOL") or 0.0)
                     upsert_balance(db,u.id,"USDC",credit)
                     db.add(Payment(user_id=u.id, type="deposit", method="solana", amount=credit, status="completed", tx=sig, meta=json.dumps({"sender":sender})))
-                    db.commit(); matched=True; bot.reply_to(message,f"✅ Verified. +{credit:.4f} USDC"); break
-            if not matched: bot.reply_to(message,"No matching tx found. Try again in 1–2 min.")
+                    db.commit(); matched=True; bot.reply_to(msg,f"✅ Verified. +{credit:.4f} USDC"); break
+            if not matched: bot.reply_to(msg,"Kein passender TX gefunden. Später erneut.")
             set_state(uid,None)
-
-        # Withdraw flow
-        elif name=="withdraw_amount":
-            try: amt=float(message.text.strip())
-            except: bot.reply_to(message,"Send a number."); return
-            if amt<=0: bot.reply_to(message,"> 0"); return
-            if get_balance(db,u.id,"USDC")<amt: bot.reply_to(message,"Not enough balance."); return
-            ctx["amount"]=amt; set_state(uid,"withdraw_dest",ctx); bot.reply_to(message,"Send destination wallet (Solana).")
-        elif name=="withdraw_dest":
-            amt=ctx["amount"]; dest=message.text.strip()
+        elif name=="wd_amt":
+            try: amt=float(msg.text.strip())
+            except: bot.reply_to(msg,"Zahl senden."); return
+            if amt<=0: bot.reply_to(msg,"> 0"); return
+            if get_balance(db,u.id,"USDC")<amt: bot.reply_to(msg,"Balance reicht nicht."); return
+            ctx["amt"]=amt; set_state(uid,"wd_dest",ctx); bot.reply_to(msg,"Ziel-Wallet (Solana) senden.")
+        elif name=="wd_dest":
+            amt=ctx["amt"]; dest=msg.text.strip()
             upsert_balance(db,u.id,"USDC",-amt)
             p=Payment(user_id=u.id, type="withdraw", method="solana", amount=amt, status="pending", meta=json.dumps({"dest":dest}))
             db.add(p); db.commit(); set_state(uid,None)
-            bot.reply_to(message,f"✅ Withdraw request #{p.id}. Admin will process.")
-
+            bot.reply_to(msg,f"✅ Withdraw #{p.id}. Admin processed.")
         # Admin credit/debit
-        elif name=="credit_user_id":
-            ctx["tid"]=message.text.strip(); set_state(uid,"credit_amount",ctx); bot.reply_to(message,"Amount (USDC).")
-        elif name=="credit_amount":
-            amt=float(message.text.strip()); tid=ctx["tid"]
-            tu=db.query(User).filter(User.telegram_id==tid).first()
-            if not tu: bot.reply_to(message,"User not found"); set_state(uid,None); return
-            upsert_balance(db, tu.id, "USDC", amt); set_state(uid,None); bot.reply_to(message,f"✅ Credited {amt:.2f} USDC to {tid}")
-        elif name=="debit_user_id":
-            ctx["tid"]=message.text.strip(); set_state(uid,"debit_amount",ctx); bot.reply_to(message,"Amount (USDC).")
-        elif name=="debit_amount":
-            amt=float(message.text.strip()); tid=ctx["tid"]
-            tu=db.query(User).filter(User.telegram_id==tid).first()
-            if not tu: bot.reply_to(message,"User not found"); set_state(uid,None); return
-            upsert_balance(db, tu.id, "USDC", -amt); set_state(uid,None); bot.reply_to(message,f"✅ Debited {amt:.2f} USDC from {tid}")
-
-        # Coinflip custom amount / waiting flows
+        elif name=="credit_uid":
+            ctx["tid"]=msg.text.strip(); set_state(uid,"credit_amt",ctx); bot.reply_to(msg,"Amount (USDC).")
+        elif name=="credit_amt":
+            amt=float(msg.text.strip()); tu=db.query(User).filter(User.telegram_id==ctx["tid"]).first()
+            if not tu: set_state(uid,None); bot.reply_to(msg,"User not found"); return
+            upsert_balance(db,tu.id,"USDC",amt); set_state(uid,None); bot.reply_to(msg,"Credited.")
+        elif name=="debit_uid":
+            ctx["tid"]=msg.text.strip(); set_state(uid,"debit_amt",ctx); bot.reply_to(msg,"Amount (USDC).")
+        elif name=="debit_amt":
+            amt=float(msg.text.strip()); tu=db.query(User).filter(User.telegram_id==ctx["tid"]).first()
+            if not tu: set_state(uid,None); bot.reply_to(msg,"User not found"); return
+            upsert_balance(db,tu.id,"USDC",-amt); set_state(uid,None); bot.reply_to(msg,"Debited.")
+        # Coinflip custom
         elif name=="cf_custom_amt":
-            try: amt=float(message.text.strip())
-            except: bot.reply_to(message,"Send a number."); return
-            if amt<=0: bot.reply_to(message,"> 0"); return
-            set_state(uid,"cf_wait_side",{"cf_amt":amt}); bot.reply_to(message,"Now choose HEADS/TAILS in Coinflip.")
+            try: amt=float(msg.text.strip())
+            except: bot.reply_to(msg,"Zahl senden."); return
+            if amt<=0: bot.reply_to(msg,"> 0"); return
+            set_state(uid,"cf_wait_side",{"cf_amt":amt}); bot.reply_to(msg,"Jetzt Kopf/Zahl drücken im Coinflip.")
         elif name=="cf_wait_amt":
-            try: amt=float(message.text.strip())
-            except: bot.reply_to(message,"Send a number."); return
+            try: amt=float(msg.text.strip())
+            except: bot.reply_to(msg,"Zahl senden."); return
             side=ctx.get("cf_side","HEADS")
-            dummy=type("C",(),{})(); dummy.id="0"; dummy.message=message
+            dummy=type("C",(),{})(); dummy.id="0"; dummy.message=msg
             _coinflip_play(db, uid, dummy, side, amt); set_state(uid,None)
         elif name=="cf_wait_side":
-            raw=message.text.strip().lower()
-            side = "HEADS" if "head" in raw or "kopf" in raw else ("TAILS" if "tail" in raw or "zahl" in raw else None)
-            if not side: bot.reply_to(message,"Write 'Kopf/Heads' or 'Zahl/Tails'."); return
+            raw=msg.text.strip().lower()
+            side = "HEADS" if ("kopf" in raw or "head" in raw) else ("TAILS" if ("zahl" in raw or "tail" in raw) else None)
+            if not side: bot.reply_to(msg,"Schreibe Kopf/Heads oder Zahl/Tails."); return
             amt=float(ctx.get("cf_amt",1.0))
-            dummy=type("C",(),{})(); dummy.id="0"; dummy.message=message
+            dummy=type("C",(),{})(); dummy.id="0"; dummy.message=msg
             _coinflip_play(db, uid, dummy, side, amt); set_state(uid,None)
-
         else:
             set_state(uid,None)
     except Exception as e:
-        dbg(f"state err: {e}"); set_state(uid,None); bot.reply_to(message, f"Error: {e}")
+        dbg(f"state err: {e}"); set_state(uid,None); bot.reply_to(msg, f"Error: {e}")
     finally:
         db.close()
 
+# category selection button during add wallet
+@bot.callback_query_handler(func=lambda c: c.data.startswith("w_add_cat:"))
+def on_add_cat(call: CallbackQuery):
+    uid=call.from_user.id
+    st=get_state(uid)
+    if not st or st["name"]!="w_add_cat": bot.answer_callback_query(call.id,"…"); return
+    cat=call.data.split(":")[1]
+    ctx=st["ctx"]; ctx["cat"]=cat
+    set_state(uid,"w_add_price",ctx)
+    bot.answer_callback_query(call.id,f"Category: {cat}")
+    bot.edit_message_text("Preis pro Woche (USDC) senden.", call.message.chat.id, call.message.message_id)
+
 # ======== Entry ========
-print("PulsePlay FULL inline bot starting…")
-bot.infinity_polling(timeout=60, long_polling_timeout=60)
+if __name__=="__main__":
+    print("PulsePlay ALL inline bot starting…")
+    bot.infinity_polling(timeout=60, long_polling_timeout=60)
