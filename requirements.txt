@@ -1,0 +1,4 @@
+pyTelegramBotAPI==4.14.0
+SQLAlchemy==2.0.29
+requests==2.31.0
+APScheduler==3.10.4
