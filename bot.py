@@ -42,7 +42,7 @@ from sqlalchemy.orm import sessionmaker, declarative_base, scoped_session, relat
 
 # ========= CONFIG =========
 BOT_TOKEN = os.getenv("ENV_BOT_TOKEN", "8200746289:AAGbzwf7sUHVHlLDb3foXbZpj9SVGnqLeNU")
-ADMIN_IDS = [int(x) for x in os.getenv("7919108078", "7919108078").split(",") if x.strip()]
+ADMIN_IDS = [int(x) for x in os.getenv("ENV_ADMIN_IDS", "7919108078").split(",") if x.strip()]
 CENTRAL_DEPOSIT_ADDRESS = os.getenv("ENV_CENTRAL_DEPOSIT_ADDRESS", "CKZEpwiVqAHLiSbdc8Ebf8xaQ2fofgPCNmzi4cV32M1s")
 SOLANA_RPC_URL = os.getenv("ENV_SOLANA_RPC_URL", "https://api.mainnet-beta.solana.com")
 USDC_SOLANA_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
