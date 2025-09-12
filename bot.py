@@ -10,7 +10,7 @@ import time
 # CONFIG (füge selbst ein)
 # ==============================
 BOT_TOKEN = "8223196888:AAEXRex4OONwq1ZSANuB2NviAtnSxiKgnqk"
-ADMIN_IDS = [7919108078, 987654321]   # Telegram-IDs der Admins
+ADMIN_IDS = [7919108078,7919108078]   # Telegram-IDs der Admins
 CENTRAL_WALLET = "3z7UW4WBBy8GJT7sA93snf3pWS64WENShZb4hKtFqtxk"
 
 # Solana RPC Endpoint (kostenlos)
