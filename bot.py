@@ -10,16 +10,20 @@ import time
 # CONFIG
 # ==============================
 BOT_TOKEN = "8223196888:AAEXRex4OONwq1ZSANuB2NviAtnSxiKgnqk"
-ADMIN_IDS = [7919108078]  # nur EIN Admin
+
+# Admins – du kannst entweder nur IDs ODER auch Usernames (ohne "@") pflegen
+ADMIN_IDS = [7919108078]            # <- trage hier DEINE echte ID ein
+ADMIN_USERNAMES = []                # z.B. ["Fux98"] (ohne @), optional
+
 CENTRAL_WALLET = "3z7UW4WBBy8GJT7sA93snf3pWS64WENShZb4hKtFqtxk"
 
 # Solana RPC Endpoint (kostenlos)
 RPC_URL = "https://api.mainnet-beta.solana.com"
 
-# Mindestbetrag in SOL
+# Mindestbetrag in SOL (nur Hinweis im UI; NICHT technisch erzwungen)
 MIN_DEPOSIT = 0.5
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
 
 # ==============================
 # DATABASE
@@ -77,6 +81,20 @@ def set_user_wallet(user_id: int, wallet: str):
     conn.commit()
     conn.close()
 
+def is_admin(user_id: int, username: str | None) -> bool:
+    """Erkennt Admin via ID ODER Username (case-insensitive, ohne @)."""
+    if user_id in ADMIN_IDS:
+        return True
+    if username:
+        uname = username.lstrip("@").lower()
+        for u in ADMIN_USERNAMES:
+            if uname == u.lower():
+                return True
+    return False
+
+def log_console(prefix, msg):
+    print(f"[{prefix}] {msg}")
+
 # ==============================
 # KEYBOARDS
 # ==============================
@@ -116,12 +134,15 @@ def deposit_admin_buttons(deposit_id: int):
 @bot.message_handler(commands=["start"])
 def start(msg):
     user_id = msg.from_user.id
-    username = msg.from_user.username or "Unbekannt"
+    username = msg.from_user.username
+
+    # Debug: wer ist das?
+    log_console("START", f"user_id={user_id}, username={username}")
 
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
     c.execute("INSERT OR IGNORE INTO users (user_id, username, wallet) VALUES (?, ?, ?)",
-              (user_id, username, None))
+              (user_id, username or "Unbekannt", None))
     conn.commit()
     conn.close()
 
@@ -131,7 +152,7 @@ def start(msg):
         "- Es gibt keine Garantie für Gewinne.\n"
         "- Bei Liquidationen oder Verlusten gibt es keine Rückerstattung.\n"
         "- Wir achten darauf, nie mit 100% Risiko zu handeln und planen alle Trades verantwortungsvoll.\n\n"
-        f"*Mindestbetrag für Einzahlungen: {MIN_DEPOSIT} SOL.*\n\n"
+        f"*Empfohlener Mindestbetrag für Einzahlungen: {MIN_DEPOSIT} SOL.*\n\n"
         "Mit Nutzung dieses Bots akzeptierst du diese Bedingungen."
     )
     bot.send_message(user_id, disclaimer, parse_mode="Markdown")
@@ -143,13 +164,21 @@ def start(msg):
         reply_markup=main_menu(),
         parse_mode="Markdown"
     )
+    # Direkt hilfreiche Info für Admin-Setup:
+    bot.send_message(user_id, f"🆔 Deine ID: `{user_id}` | Username: `{username or '—'}`", parse_mode="Markdown")
 
 @bot.message_handler(commands=["admin"])
 def admin_panel(msg):
-    if msg.from_user.id in ADMIN_IDS:
+    uid = msg.from_user.id
+    uname = msg.from_user.username
+    if is_admin(uid, uname):
         bot.send_message(msg.chat.id, "⚙️ Admin-Menü", reply_markup=admin_menu())
     else:
         bot.reply_to(msg, "❌ Du bist kein Admin.")
+
+@bot.message_handler(commands=["whoami"])
+def whoami(msg):
+    bot.reply_to(msg, f"🆔 Deine ID: {msg.from_user.id}\n👤 Username: @{msg.from_user.username}" if msg.from_user.username else f"🆔 Deine ID: {msg.from_user.id}\n👤 Username: —")
 
 # ==============================
 # CALLBACK HANDLER
@@ -157,11 +186,16 @@ def admin_panel(msg):
 @bot.callback_query_handler(func=lambda call: True)
 def callback_handler(call: CallbackQuery):
     user_id = call.from_user.id
+    username = call.from_user.username
+
     conn = sqlite3.connect("bot.db")
     c = conn.cursor()
 
     if call.data == "back_main":
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        try:
+            bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=None)
+        except Exception:
+            pass
         bot.send_message(user_id, "🏠 Hauptmenü", reply_markup=main_menu())
 
     elif call.data == "deposit":
@@ -175,12 +209,12 @@ def callback_handler(call: CallbackQuery):
             )
             bot.register_next_step_handler(call.message, save_wallet_then_show_central_wallet)
         else:
-            # Direkt zentrale Wallet anzeigen + Mindestbetrag-Hinweis
+            # Direkt zentrale Wallet anzeigen (Hinweis nur Info)
             bot.send_message(
                 user_id,
                 f"💸 Sende jetzt an unsere zentrale Wallet:\n\n`{CENTRAL_WALLET}`\n\n"
                 f"⚠️ *Wichtig:* Nur Einzahlungen **von deiner registrierten Wallet** werden erkannt.\n"
-                f"📏 *Mindestbetrag:* **{MIN_DEPOSIT} SOL**.",
+                f"ℹ️ Empfohlener Mindestbetrag: **{MIN_DEPOSIT} SOL** (kleinere Beträge werden auch erkannt).",
                 parse_mode="Markdown"
             )
 
@@ -219,7 +253,7 @@ def callback_handler(call: CallbackQuery):
         bot.send_message(
             user_id,
             "📅 Auszahlungen erfolgen manuell durch die Admins.\n"
-            f"📏 *Mindestbetrag für Einzahlungen:* **{MIN_DEPOSIT} SOL**.",
+            f"ℹ️ Empfohlener Mindestbetrag für Einzahlungen: **{MIN_DEPOSIT} SOL**.",
             parse_mode="Markdown"
         )
 
@@ -227,7 +261,7 @@ def callback_handler(call: CallbackQuery):
         bot.send_message(user_id, "🛠 Support: @Fux98")
 
     # ----- ADMIN PANEL -----
-    elif call.data == "all_users" and user_id in ADMIN_IDS:
+    elif call.data == "all_users" and is_admin(user_id, username):
         c.execute("SELECT user_id, username, wallet FROM users ORDER BY user_id DESC")
         rows = c.fetchall()
         if not rows:
@@ -238,7 +272,7 @@ def callback_handler(call: CallbackQuery):
                 text += f"👤 {r[1]} | ID: {r[0]} | Wallet: {r[2]}\n"
             bot.send_message(user_id, text, parse_mode="Markdown")
 
-    elif call.data == "all_deposits" and user_id in ADMIN_IDS:
+    elif call.data == "all_deposits" and is_admin(user_id, username):
         c.execute("SELECT id, user_id, amount, timestamp, status FROM deposits ORDER BY id DESC")
         rows = c.fetchall()
         if rows:
@@ -254,7 +288,7 @@ def callback_handler(call: CallbackQuery):
         else:
             bot.send_message(user_id, "❌ Keine Einzahlungen vorhanden.")
 
-    elif call.data == "pending_payouts" and user_id in ADMIN_IDS:
+    elif call.data == "pending_payouts" and is_admin(user_id, username):
         c.execute("SELECT id, user_id, amount, timestamp FROM deposits WHERE status='Eingezahlt' ORDER BY id ASC")
         rows = c.fetchall()
         if rows:
@@ -269,23 +303,33 @@ def callback_handler(call: CallbackQuery):
         else:
             bot.send_message(user_id, "✅ Keine offenen Auszahlungen.")
 
-    elif call.data.startswith("payout_done") and user_id in ADMIN_IDS:
+    elif call.data.startswith("payout_done") and is_admin(user_id, username):
         dep_id = call.data.split(":")[1]
         c.execute("UPDATE deposits SET status=? WHERE id=?", ("Ausgezahlt", dep_id))
         conn.commit()
         bot.send_message(user_id, f"✅ Auszahlung für Einzahlung #{dep_id} markiert.")
 
-    elif call.data.startswith("payout_problem") and user_id in ADMIN_IDS:
+    elif call.data.startswith("payout_problem") and is_admin(user_id, username):
         dep_id = call.data.split(":")[1]
         c.execute("UPDATE deposits SET status=? WHERE id=?", ("Problem", dep_id))
         conn.commit()
         bot.send_message(user_id, f"❗ Problem bei Einzahlung #{dep_id} markiert.")
+
+    else:
+        # Nicht-Admin versucht Admin-Action
+        if call.data in ("all_users", "all_deposits", "pending_payouts") or \
+           call.data.startswith(("payout_done", "payout_problem")):
+            bot.answer_callback_query(call.id, "❌ Keine Admin-Berechtigung.", show_alert=True)
 
     conn.close()
 
 # ==============================
 # WALLET SET/CHANGE
 # ==============================
+@bot.message_handler(func=lambda m: False)
+def _placeholder(_):  # verhindert "falsche" Handler-Kollision
+    pass
+
 def save_wallet(msg):
     user_id = msg.from_user.id
     candidate = (msg.text or "").strip()
@@ -310,7 +354,7 @@ def save_wallet_then_show_central_wallet(msg):
         user_id,
         f"💸 Sende jetzt an unsere zentrale Wallet:\n\n`{CENTRAL_WALLET}`\n\n"
         f"⚠️ Nur Einzahlungen von deiner **registrierten Wallet** werden erkannt.\n"
-        f"📏 *Mindestbetrag:* **{MIN_DEPOSIT} SOL**.",
+        f"ℹ️ Empfohlener Mindestbetrag: **{MIN_DEPOSIT} SOL** (kleinere Beträge werden auch erkannt).",
         parse_mode="Markdown"
     )
 
@@ -351,7 +395,7 @@ def check_transactions_loop():
     """
     Erkennung:
     - Finde Index der CENTRAL_WALLET in accountKeys.
-    - Betrag = (postBalances[idx] - preBalances[idx]) / 1e9; nur wenn >= MIN_DEPOSIT.
+    - Betrag = (postBalances[idx] - preBalances[idx]) / 1e9 (ALLE Beträge speichern).
     - Sende-Index = Account mit größtem negativen Delta (vermutlich Sender).
     - Prüfe, ob Sender als User-Wallet registriert ist.
     - Speichere nur neue TXs (per 'seen' verhindert Doppelungen).
@@ -399,9 +443,6 @@ def check_transactions_loop():
                     continue
 
                 amount_sol = round(delta_lamports / 1e9, 9)
-                if amount_sol < MIN_DEPOSIT:
-                    # Mindestbetrag nicht erreicht -> ignorieren
-                    continue
 
                 # Sender heuristisch: größter negativer Delta
                 sender_idx = None
@@ -433,12 +474,14 @@ def check_transactions_loop():
                     conn.commit()
                     conn.close()
 
-                    # Admin benachrichtigen
+                    # Hinweis an Admin, falls unter empfohlenem Mindestbetrag
+                    min_note = " ⚠️ *unter Mindestbetrag*" if amount_sol < MIN_DEPOSIT else ""
+
                     for admin in ADMIN_IDS:
                         try:
                             bot.send_message(
                                 admin,
-                                f"💰 *Neue Einzahlung erkannt!*\n\n"
+                                f"💰 *Neue Einzahlung erkannt!*{min_note}\n\n"
                                 f"👤 User-ID: {user_id}\n"
                                 f"📥 Betrag: {amount_sol} SOL\n"
                                 f"🔑 Wallet (Absender): {sender_key}\n"
