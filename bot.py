@@ -144,7 +144,7 @@ def start(msg):
         "- Es gibt keine Garantie für Gewinne.\n"
         "- Bei Liquidationen oder Verlusten gibt es keine Rückerstattung.\n"
         "- Wir achten darauf, nie mit 100% Risiko zu handeln und planen alle Trades verantwortungsvoll.\n\n"
-        f"ℹ️ Empfohlener Mindestbetrag: <b>{MIN_DEPOSIT} SOL</b>.\n\n"
+        f"ℹ️  Mindestbetrag: <b>{MIN_DEPOSIT} SOL</b>.\n\n"
         "Mit Nutzung dieses Bots akzeptierst du diese Bedingungen."
     )
     bot.send_message(user_id, disclaimer)
@@ -197,7 +197,7 @@ def callback_handler(call: CallbackQuery):
                     user_id,
                     f"💸 Sende jetzt an unsere zentrale Wallet:\n\n<code>{esc(CENTRAL_WALLET)}</code>\n\n"
                     f"⚠️ <i>Nur Einzahlungen</i> <b>von deiner registrierten Wallet</b> werden erkannt.\n"
-                    f"ℹ️ Empfohlener Mindestbetrag: <b>{MIN_DEPOSIT} SOL</b> (kleinere Beträge werden auch erkannt).",
+                    f"ℹ️  Mindestbetrag: <b>{MIN_DEPOSIT} SOL</b> .",
                     reply_markup=back_menu()
                 )
 
