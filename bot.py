@@ -24,7 +24,7 @@ CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "3wyVwpcbWt96mphJjskFsR2qoy
 
 DB_PATH = "memebot.db"
 LAMPORTS_PER_SOL = 1_000_000_000
-MIN_SUB_SOL = 0.2
+MIN_SUB_SOL = 0.1
 
 _price_cache = {"t": 0, "usd": 0.0}
 
@@ -494,8 +494,8 @@ def on_cb(c:CallbackQuery):
             f"   Zentrale Adresse: `{CENTRAL_SOL_PUBKEY}`\n"
             "   Gutschrift nur, wenn die Quelle = deine Absender-Wallet ist.\n"
             "2) *Signale abonnieren*: Mindestguthaben 0.2 SOL. Deaktivieren jederzeit.\n"
-            "3) *Auto-Entry*: ON/OFF. Risiko (Low/Medium/High) steuert Einsatz (5/10/20%).\n"
-            "4) *Auszahlung*: Betrag in SOL eingeben; Admin bestätigt & sendet.",
+            "3) *Auto-Entry*: ON/OFF. Risiko (Low/Medium/High) steuert Einsat (20%/35%/65%).\n"
+            "4) *Auszahlung*: Betrag in SOL eingeben; .",
             c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_main(u))
         return
 
@@ -860,7 +860,7 @@ def catch_all(m:Message):
         return
 
 def risk_to_fraction(risk:str)->float:
-    return {"LOW":0.05, "MEDIUM":0.10, "HIGH":0.20}.get((risk or "").upper(), 0.10)
+    return {"LOW":0.20, "MEDIUM":0.35, "HIGH":0.65}.get((risk or "").upper(), 0.35)
 
 def auto_executor_loop():
     while True:
