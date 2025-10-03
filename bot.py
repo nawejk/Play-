@@ -14,7 +14,7 @@ import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAH0h6aL_KHu8oxeEijNWofudadPmVKEKrk").strip() or "REPLACE_ME"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAEef451aXGOS-3Y3CTi-hCZDHlm4Hwph-U").strip() or "REPLACE_ME"
 if not BOT_TOKEN or BOT_TOKEN == "REPLACE_ME":
     raise RuntimeError("BOT_TOKEN env missing")
 
