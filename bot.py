@@ -1,27 +1,6 @@
 # bot.py
 # Signals & Auto-Entry Bot — Central-Deposit + Live USDC (RAW RPC) + Markdown-Fix + RPC Backoff
-#
-# Änderungen (genau nach Wunsch):
-# - Einzahlung nutzt NUR die zentrale Adresse (CENTRAL_SOL_PUBKEY).
-# - User MUSS zuerst seine Absender-Wallet angeben.
-# - Watcher scannt die zentrale Adresse via RPC (getSignaturesForAddress/getTransaction, jsonParsed)
-#   und schreibt Guthaben gut, wenn Quelle == Absender-Wallet.
-# - Neben SOL-Beträgen wird der Live-Preis in USDC angezeigt.
-# - KEINE Imports von solana/solders/PublicKey/etc.
-# - Zentrale Adresse wird als Code angezeigt (leicht kopierbar).
-# - Markdown-Entity-Fix (md_escape) für User-Input (z. B. @names_mit_unterstrich).
-# - RPC Backoff + längeres Intervall, Limit reduziert → weniger 429.
-#
-# Setup:
-#   pip install -r requirements.txt
-#
-# ENV / Defaults:
-#   BOT_TOKEN = ... (dein Bot Token)
-#   ADMIN_IDS = 8076025426
-#   SOLANA_RPC = https://api.mainnet-beta.solana.com
-#   CENTRAL_SOL_PUBKEY = 3wyVwpcbWt96mphJjskFsR2qoyafqJuSfGZYmiipW4oy
-#
-# Start: python bot.py
+# (änderungen: kein Balance-Abzug im Auto-Executor; Admin-Listen zeigen UID + Username)
 
 import os
 import time
@@ -35,9 +14,7 @@ import requests
 import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 
-# ------------------------ CONFIG ------------------------
-
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAHs0yUOnozpBXFR0rHhKBA_gi-ABA4LBns").strip() or "REPLACE_ME"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAH0h6aL_KHu8oxeEijNWofudadPmVKEKrk").strip() or "REPLACE_ME"
 if not BOT_TOKEN or BOT_TOKEN == "REPLACE_ME":
     raise RuntimeError("BOT_TOKEN env missing")
 
@@ -48,8 +25,6 @@ CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "3wyVwpcbWt96mphJjskFsR2qoy
 DB_PATH = "memebot.db"
 LAMPORTS_PER_SOL = 1_000_000_000
 MIN_SUB_SOL = 0.2
-
-# ------------------------ SIMPLE PRICE (SOL->USDC) ------------------------
 
 _price_cache = {"t": 0, "usd": 0.0}
 
@@ -79,34 +54,29 @@ def fmt_sol_usdc(lamports_or_int: int) -> str:
         return f"{sol:.6f} SOL (~{sol*usd:.2f} USDC)"
     return f"{sol:.6f} SOL"
 
-# ------------------------ DB ------------------------
-
 SCHEMA = """
 PRAGMA journal_mode=WAL;
-
 CREATE TABLE IF NOT EXISTS users (
   user_id INTEGER PRIMARY KEY,
   username TEXT,
   is_admin INTEGER DEFAULT 0,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
   sub_active INTEGER DEFAULT 0,
-  auto_mode TEXT DEFAULT 'OFF',           -- OFF | ON
-  auto_risk TEXT DEFAULT 'MEDIUM',        -- LOW | MEDIUM | HIGH
+  auto_mode TEXT DEFAULT 'OFF',
+  auto_risk TEXT DEFAULT 'MEDIUM',
   sol_balance_lamports INTEGER DEFAULT 0,
   source_wallet TEXT
 );
-
 CREATE TABLE IF NOT EXISTS seen_txs (
   sig TEXT PRIMARY KEY,
   user_id INTEGER,
   amount_lamports INTEGER,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-
 CREATE TABLE IF NOT EXISTS calls (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   created_by INTEGER NOT NULL,
-  market_type TEXT NOT NULL,            -- MEME | FUTURES
+  market_type TEXT NOT NULL,
   base TEXT NOT NULL,
   side TEXT,
   leverage TEXT,
@@ -114,29 +84,24 @@ CREATE TABLE IF NOT EXISTS calls (
   notes TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-
 CREATE TABLE IF NOT EXISTS executions (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   call_id INTEGER NOT NULL,
   user_id INTEGER NOT NULL,
-  mode TEXT NOT NULL,                   -- ON
-  status TEXT NOT NULL,                 -- QUEUED | FILLED | ERROR
+  mode TEXT NOT NULL,
+  status TEXT NOT NULL,
   txid TEXT,
   message TEXT,
-  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  FOREIGN KEY(call_id) REFERENCES calls(id),
-  FOREIGN KEY(user_id) REFERENCES users(user_id)
+  created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
-
 CREATE TABLE IF NOT EXISTS payouts (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id INTEGER NOT NULL,
   amount_lamports INTEGER NOT NULL,
-  status TEXT DEFAULT 'REQUESTED',      -- REQUESTED | APPROVED | SENT | REJECTED
+  status TEXT DEFAULT 'REQUESTED',
   note TEXT,
   created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-  last_notified_at TIMESTAMP,
-  FOREIGN KEY(user_id) REFERENCES users(user_id)
+  last_notified_at TIMESTAMP
 );
 """
 
@@ -163,8 +128,6 @@ def init_db():
         ]:
             try: con.execute(stmt)
             except Exception: pass
-
-# ------------------------ HELPERS ------------------------
 
 def md_escape(text: str) -> str:
     if not isinstance(text, str):
@@ -213,8 +176,8 @@ def add_balance(user_id:int, lamports:int):
 
 def subtract_balance(user_id:int, lamports:int)->bool:
     with get_db() as con:
-        bal_row = con.execute("SELECT sol_balance_lamports FROM users WHERE user_id=?", (user_id,)).fetchone()
-        bal = bal_row["sol_balance_lamports"] if bal_row else 0
+        row = con.execute("SELECT sol_balance_lamports FROM users WHERE user_id=?", (user_id,)).fetchone()
+        bal = row["sol_balance_lamports"] if row else 0
         if bal < lamports: return False
         con.execute("UPDATE users SET sol_balance_lamports = sol_balance_lamports - ? WHERE user_id=?", (lamports, user_id))
         return True
@@ -267,8 +230,6 @@ def fmt_call(c)->str:
     note = f"\nNotes: {md_escape(c['notes'])}" if c["notes"] else ""
     return f"🧩 *{core}*{extra}{note}"
 
-# ------------------------ KEYBOARDS ------------------------
-
 def kb_main(u):
     bal = fmt_sol_usdc(u["sol_balance_lamports"])
     kb = InlineKeyboardMarkup()
@@ -313,8 +274,6 @@ def kb_payout_manage(pid:int):
            InlineKeyboardButton("📤 Gesendet", callback_data=f"payout_SENT_{pid}"),
            InlineKeyboardButton("❌ Ablehnen", callback_data=f"payout_REJECT_{pid}"))
     return kb
-
-# ------------------------ RAW SOLANA RPC HELPERS ------------------------
 
 checked_signatures = set()
 
@@ -380,11 +339,7 @@ def get_tx_details(sig: str, central_addr: str):
         except ValueError:
             return None
 
-        if central_idx < len(pre) and central_idx < len(post):
-            delta_central = post[central_idx] - pre[central_idx]
-        else:
-            delta_central = 0
-
+        delta_central = post[central_idx] - pre[central_idx] if central_idx < len(pre) and central_idx < len(post) else 0
         if delta_central <= 0:
             return None
 
@@ -397,8 +352,7 @@ def get_tx_details(sig: str, central_addr: str):
         if not sender:
             for inst in (txmsg.get('instructions') or []):
                 if isinstance(inst, dict):
-                    parsed = inst.get('parsed') or {}
-                    info = parsed.get('info') or {}
+                    info = (inst.get('parsed') or {}).get('info') or {}
                     if info.get('destination') == central_addr and info.get('source'):
                         sender = info['source']; break
                     if info.get('to') == central_addr and info.get('from'):
@@ -409,14 +363,12 @@ def get_tx_details(sig: str, central_addr: str):
         print("get_tx_details error:", e)
         return None
 
-# ------------------------ WATCHER (zentraler Pubkey via RAW RPC) ------------------------
-
 class CentralWatcher:
     def __init__(self, central_addr:str):
         self.central = central_addr
         self._thread: Optional[threading.Thread] = None
         self._running = False
-        self.on_verified_deposit = None  # callback(evt)
+        self.on_verified_deposit = None
 
     def start(self, interval_sec:int=40):
         if self._running: return
@@ -455,34 +407,26 @@ class CentralWatcher:
             if self._is_seen(sig):
                 checked_signatures.add(sig)
                 continue
-
             details = get_tx_details(sig, self.central)
             checked_signatures.add(sig)
             if not details:
                 continue
-
             sender = details.get("from")
             amount = int(details.get("amount_lamports") or 0)
             if not sender or amount <= 0:
                 continue
-
             uid = src_map.get(sender)
             if not uid:
                 continue
-
             self._mark_seen(sig, uid, amount)
             if self.on_verified_deposit:
                 self.on_verified_deposit({"user_id": uid, "amount_lamports": amount, "sig": sig})
-
-# ------------------------ CONNECTOR STUBS ------------------------
 
 def dex_market_buy_simulated(user_id:int, base:str, amount_lamports:int):
     return {"status":"FILLED", "txid":"SIM-TX-"+base, "spent_lamports": amount_lamports}
 
 def futures_place_simulated(user_id:int, base:str, side:str, leverage:str, risk:str):
     return {"status":"FILLED", "order_id":"SIM-ORDER", "base":base, "side":side, "lev":leverage, "risk":risk}
-
-# ------------------------ BOT ------------------------
 
 init_db()
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
@@ -531,8 +475,6 @@ def cmd_start(m:Message):
     upsert_user(uid, uname, admin_flag)
     u = get_user(uid)
     bot.reply_to(m, home_text(u), reply_markup=kb_main(u))
-
-# ------------------------ CALLBACKS ------------------------
 
 @bot.callback_query_handler(func=lambda c: True)
 def on_cb(c:CallbackQuery):
@@ -630,7 +572,6 @@ def on_cb(c:CallbackQuery):
             parse_mode="Markdown")
         return
 
-    # ----- Admin -----
     if data == "admin_menu":
         if not is_admin(uid):
             bot.answer_callback_query(c.id, "Nicht erlaubt.")
@@ -646,9 +587,9 @@ def on_cb(c:CallbackQuery):
             return
         parts = ["👥 *Investoren (Top 50)*"]
         for r in rows:
-            name = "@"+r["username"] if r["username"] else str(r["user_id"])
+            name = "@"+r["username"] if r["username"] else "(kein Username)"
             parts.append(
-                f"- {md_escape(name)} • {fmt_sol_usdc(r['sol_balance_lamports'])}\n"
+                f"- {md_escape(name)} (UID {r['user_id']}) • {fmt_sol_usdc(r['sol_balance_lamports'])}\n"
                 f"  Source: `{r['source_wallet'] or '-'}`"
             )
         bot.answer_callback_query(c.id)
@@ -710,7 +651,8 @@ def on_cb(c:CallbackQuery):
             return
         bot.answer_callback_query(c.id)
         for r in rows:
-            txt = (f"🧾 *Auszahlung #{r['id']}* • {('@'+r['username']) if r['username'] else r['user_id']}\n"
+            uname = "@"+(r["username"] or "") if r["username"] else "(kein Username)"
+            txt = (f"🧾 *Auszahlung #{r['id']}* • {md_escape(uname)} (UID {r['user_id']})\n"
                    f"Betrag: *{fmt_sol_usdc(r['amount_lamports'])}*\n"
                    f"Status: `{r['status']}`\n"
                    f"Notiz: {md_escape(r['note']) if r['note'] else '-'}")
@@ -757,8 +699,6 @@ def on_cb(c:CallbackQuery):
             try: bot.send_message(row["user_id"], "❌ Deine Auszahlung wurde *abgelehnt*.", parse_mode="Markdown")
             except: pass
         return
-
-# ------------------------ MESSAGE HANDLERS ------------------------
 
 def is_probably_solana_address(addr: str) -> bool:
     if not isinstance(addr, str):
@@ -919,8 +859,6 @@ def catch_all(m:Message):
         bot.reply_to(m, f"✅ Trade-Status gesendet an {sent} Abonnenten.")
         return
 
-# ------------------------ AUTO EXECUTOR (simuliert) ------------------------
-
 def risk_to_fraction(risk:str)->float:
     return {"LOW":0.05, "MEDIUM":0.10, "HIGH":0.20}.get((risk or "").upper(), 0.10)
 
@@ -942,51 +880,39 @@ def auto_executor_loop():
                     continue
                 call = get_call(r["call_id"])
                 frac = risk_to_fraction(r["auto_risk"] or "MEDIUM")
-                stake_lamports = max(int(r["sol_balance_lamports"] * frac), int(0.01 * LAMPORTS_PER_SOL))
-                if stake_lamports <= 0 or r["sol_balance_lamports"] < stake_lamports:
-                    with get_db() as con:
-                        con.execute("UPDATE executions SET status='ERROR', message='Zu wenig Guthaben' WHERE id=?", (r["eid"],))
-                    continue
-                if not subtract_balance(r["user_id"], stake_lamports):
-                    with get_db() as con:
-                        con.execute("UPDATE executions SET status='ERROR', message='Balance-Abzug fehlgeschlagen' WHERE id=?", (r["eid"],))
-                    continue
-
+                stake_info = max(int(r["sol_balance_lamports"] * frac), int(0.01 * LAMPORTS_PER_SOL))
                 if call["market_type"] == "FUTURES":
                     result = futures_place_simulated(r["user_id"], call["base"], call["side"], call["leverage"], r["auto_risk"])
                 else:
-                    result = dex_market_buy_simulated(r["user_id"], call["base"], stake_lamports)
-
-                status = result.get("status","ERROR")
+                    result = dex_market_buy_simulated(r["user_id"], call["base"], stake_info)
+                status = "FILLED"
                 txid = result.get("txid") or result.get("order_id") or ""
                 with get_db() as con:
                     con.execute("UPDATE executions SET status=?, txid=?, message=? WHERE id=?",
-                                (status, txid, str(result), r["eid"]))
-
-                risk = (r["auto_risk"] or "MEDIUM").upper()
-                pnl_frac = {"LOW":0.01, "MEDIUM":0.0, "HIGH":0.02}.get(risk, 0.0)
-                pnl = int(stake_lamports * pnl_frac)
-                if pnl != 0:
-                    add_balance(r["user_id"], pnl)
-
+                                (status, txid, "JOINED (no-balance-change)", r["eid"]))
                 try:
-                    bal_after = get_balance_lamports(r["user_id"])
+                    current_bal = get_balance_lamports(r["user_id"])
                     bot.send_message(
                         r["user_id"],
-                        f"🤖 Auto-Entry • {risk}\n"
-                        f"{fmt_call(call)}\n"
-                        f"Status: *{status}*\n"
-                        f"Einsatz: {fmt_sol_usdc(stake_lamports)} | P&L: {fmt_sol_usdc(pnl)}\n"
-                        f"Guthaben: *{fmt_sol_usdc(bal_after)}*\n"
-                        f"`{txid}`",
+                        "🤖 Auto-Entry • {risk}\n"
+                        "{call_text}\n"
+                        "Status: *JOINED*\n"
+                        "Auto-Trading ist für diesen Call aktiviert.\n"
+                        "Einsatz (Info): {stake}\n"
+                        "Guthaben bleibt unverändert: *{balance}*\n"
+                        "`{txid}`".format(
+                            risk=(r["auto_risk"] or "MEDIUM").upper(),
+                            call_text=fmt_call(call),
+                            stake=fmt_sol_usdc(stake_info),
+                            balance=fmt_sol_usdc(current_bal),
+                            txid=txid
+                        ),
                         parse_mode="Markdown")
                 except Exception as e:
                     print("notify exec error:", e)
         except Exception as e:
             print("executor loop error:", e)
         time.sleep(5)
-
-# ------------------------ REMINDER (Payouts) ------------------------
 
 def payout_reminder_loop():
     while True:
@@ -1011,8 +937,6 @@ def payout_reminder_loop():
         except Exception as e:
             print("payout reminder loop error:", e)
             time.sleep(60)
-
-# ------------------------ RUN ------------------------
 
 threading.Thread(target=auto_executor_loop, daemon=True).start()
 threading.Thread(target=payout_reminder_loop, daemon=True).start()
