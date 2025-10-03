@@ -1,5 +1,5 @@
-# bot_single.py
-# Signals & Auto-Entry Bot — Central-Deposit + Live USDC (RAW RPC)
+# bot.py
+# Signals & Auto-Entry Bot — Central-Deposit + Live USDC (RAW RPC) + Markdown-Fix + RPC Backoff
 #
 # Änderungen (genau nach Wunsch):
 # - Einzahlung nutzt NUR die zentrale Adresse (CENTRAL_SOL_PUBKEY).
@@ -9,12 +9,14 @@
 # - Neben SOL-Beträgen wird der Live-Preis in USDC angezeigt.
 # - KEINE Imports von solana/solders/PublicKey/etc.
 # - Zentrale Adresse wird als Code angezeigt (leicht kopierbar).
+# - Markdown-Entity-Fix (md_escape) für User-Input (z. B. @names_mit_unterstrich).
+# - RPC Backoff + längeres Intervall, Limit reduziert → weniger 429.
 #
 # Setup:
-#   pip install pyTelegramBotAPI requests python-dotenv pytz
+#   pip install -r requirements.txt
 #
 # ENV / Defaults:
-#   BOT_TOKEN = 8212740282:AAHs0yUOnozpBXFR0rHhKBA_gi-ABA4LBns
+#   BOT_TOKEN = ... (dein Bot Token)
 #   ADMIN_IDS = 8076025426
 #   SOLANA_RPC = https://api.mainnet-beta.solana.com
 #   CENTRAL_SOL_PUBKEY = 3wyVwpcbWt96mphJjskFsR2qoyafqJuSfGZYmiipW4oy
@@ -23,6 +25,7 @@
 
 import os
 import time
+import random
 import threading
 import sqlite3
 from contextlib import contextmanager
@@ -34,8 +37,8 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, C
 
 # ------------------------ CONFIG ------------------------
 
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAHs0yUOnozpBXFR0rHhKBA_gi-ABA4LBns").strip()
-if not BOT_TOKEN:
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAHs0yUOnozpBXFR0rHhKBA_gi-ABA4LBns").strip() or "REPLACE_ME"
+if not BOT_TOKEN or BOT_TOKEN == "REPLACE_ME":
     raise RuntimeError("BOT_TOKEN env missing")
 
 ADMIN_IDS = [a.strip() for a in os.getenv("ADMIN_IDS", "8076025426").split(",") if a.strip()]
@@ -163,6 +166,16 @@ def init_db():
 
 # ------------------------ HELPERS ------------------------
 
+def md_escape(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    return (text
+            .replace('\\', '\\\\')
+            .replace('_', '\\_')
+            .replace('*', '\\*')
+            .replace('`', '\\`')
+            .replace('[', '\\['))
+
 def is_admin(user_id:int)->bool:
     return str(user_id) in ADMIN_IDS
 
@@ -251,7 +264,7 @@ def fmt_call(c)->str:
     else:
         core = f"Meme • {c['base']}"
     extra = f"\nToken: `{c['token_address']}`" if (c["market_type"]=="MEME" and c["token_address"]) else ""
-    note = f"\nNotes: {c['notes']}" if c["notes"] else ""
+    note = f"\nNotes: {md_escape(c['notes'])}" if c["notes"] else ""
     return f"🧩 *{core}*{extra}{note}"
 
 # ------------------------ KEYBOARDS ------------------------
@@ -305,20 +318,30 @@ def kb_payout_manage(pid:int):
 
 checked_signatures = set()
 
-def rpc(method: str, params: list):
-    try:
-        r = requests.post(
-            SOLANA_RPC,
-            json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
-            timeout=10
-        )
-        r.raise_for_status()
-        return r.json()
-    except Exception as e:
-        print("RPC error:", e)
-        return {"result": None}
+def rpc(method: str, params: list, *, _retries=2, _base_sleep=0.8):
+    for attempt in range(_retries + 1):
+        try:
+            r = requests.post(
+                SOLANA_RPC,
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                timeout=10
+            )
+            if r.status_code == 429:
+                sleep_s = _base_sleep * (2 ** attempt) + random.uniform(0, 0.4)
+                time.sleep(sleep_s)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except requests.RequestException as e:
+            if attempt < _retries:
+                sleep_s = _base_sleep * (2 ** attempt) + random.uniform(0, 0.4)
+                time.sleep(sleep_s)
+                continue
+            print("RPC error:", e)
+            return {"result": None}
+    return {"result": None}
 
-def get_new_signatures_for_address(address: str, limit: int = 50) -> List[str]:
+def get_new_signatures_for_address(address: str, limit: int = 20) -> List[str]:
     try:
         res = rpc("getSignaturesForAddress", [address, {"limit": limit}])
         arr = res.get("result") or []
@@ -395,7 +418,7 @@ class CentralWatcher:
         self._running = False
         self.on_verified_deposit = None  # callback(evt)
 
-    def start(self, interval_sec:int=25):
+    def start(self, interval_sec:int=40):
         if self._running: return
         self._running = True
         self._thread = threading.Thread(target=self._loop, args=(interval_sec,), daemon=True)
@@ -420,7 +443,7 @@ class CentralWatcher:
                         (sig, user_id, lamports))
 
     def scan_central_recent(self):
-        sigs = get_new_signatures_for_address(self.central, limit=50)
+        sigs = get_new_signatures_for_address(self.central, limit=20)
         if not sigs:
             return
 
@@ -487,11 +510,11 @@ def _on_verified_deposit(evt:dict):
         print("notify deposit error:", e)
 
 watcher.on_verified_deposit = _on_verified_deposit
-shepherd = threading.Thread(target=watcher.start, kwargs={"interval_sec":25}, daemon=True)
-shepherd.start()
+threading.Thread(target=watcher.start, kwargs={"interval_sec":40}, daemon=True).start()
 
 def home_text(u)->str:
-    uname = ("@"+u["username"]) if u["username"] else f"ID {u['user_id']}"
+    raw_uname = ("@"+u["username"]) if u["username"] else f"ID {u['user_id']}"
+    uname = md_escape(raw_uname)
     bal = fmt_sol_usdc(u["sol_balance_lamports"])
     return (
         f"Willkommen, {uname}! 👋\n"
@@ -623,8 +646,9 @@ def on_cb(c:CallbackQuery):
             return
         parts = ["👥 *Investoren (Top 50)*"]
         for r in rows:
+            name = "@"+r["username"] if r["username"] else str(r["user_id"])
             parts.append(
-                f"- {('@'+r['username']) if r['username'] else r['user_id']} • {fmt_sol_usdc(r['sol_balance_lamports'])}\n"
+                f"- {md_escape(name)} • {fmt_sol_usdc(r['sol_balance_lamports'])}\n"
                 f"  Source: `{r['source_wallet'] or '-'}`"
             )
         bot.answer_callback_query(c.id)
@@ -689,7 +713,7 @@ def on_cb(c:CallbackQuery):
             txt = (f"🧾 *Auszahlung #{r['id']}* • {('@'+r['username']) if r['username'] else r['user_id']}\n"
                    f"Betrag: *{fmt_sol_usdc(r['amount_lamports'])}*\n"
                    f"Status: `{r['status']}`\n"
-                   f"Notiz: {r['note'] or '-'}")
+                   f"Notiz: {md_escape(r['note']) if r['note'] else '-'}")
             bot.send_message(c.message.chat.id, txt, parse_mode="Markdown", reply_markup=kb_payout_manage(r["id"]))
         return
 
@@ -869,7 +893,7 @@ def catch_all(m:Message):
                 nb = fmt_sol_usdc(get_balance_lamports(tuid))
                 bot.reply_to(m, f"✅ Guthaben geändert: {tuid} {fmt_sol_usdc(lam)} • Neues Guthaben: {nb}. {note}")
                 try:
-                    bot.send_message(tuid, f"📒 Admin-Anpassung: {fmt_sol_usdc(lam)}\nNeues Guthaben: {nb}\n{note}")
+                    bot.send_message(tuid, f"📒 Admin-Anpassung: {fmt_sol_usdc(lam)}\nNeues Guthaben: {nb}\n{md_escape(note)}")
                 except: pass
         except Exception as e:
             bot.reply_to(m, "Fehler beim Parsen. Siehe Beispiele oben.")
@@ -888,7 +912,7 @@ def catch_all(m:Message):
         sent = 0
         for su in subs:
             try:
-                bot.send_message(su, f"📢 *Trade-Update*: {msg}", parse_mode="Markdown")
+                bot.send_message(su, f"📢 *Trade-Update*: {md_escape(msg)}", parse_mode="Markdown")
                 sent += 1
             except Exception as e:
                 print("trade status broadcast error", su, e)
@@ -995,4 +1019,3 @@ threading.Thread(target=payout_reminder_loop, daemon=True).start()
 
 print("Bot läuft...")
 bot.infinity_polling(timeout=60, long_polling_timeout=60)
-PY
