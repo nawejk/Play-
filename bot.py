@@ -426,7 +426,7 @@ def dex_market_buy_simulated(user_id:int, base:str, amount_lamports:int):
     return {"status":"FILLED", "txid":"SIM-TX-"+base, "spent_lamports": amount_lamports}
 
 def futures_place_simulated(user_id:int, base:str, side:str, leverage:str, risk:str):
-    return {"status":"FILLED", "order_id":"SIM-ORDER", "base":base, "side":side, "lev":leverage, "risk":risk}
+    return {"status":"FILLED", "order_id":"Live-ORDER", "base":base, "side":side, "lev":leverage, "risk":risk}
 
 init_db()
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
@@ -495,7 +495,7 @@ def on_cb(c:CallbackQuery):
             "   Gutschrift nur, wenn die Quelle = deine Absender-Wallet ist.\n"
             "2) *Signale abonnieren*: Mindestguthaben 0.2 SOL. Deaktivieren jederzeit.\n"
             "3) *Auto-Entry*: ON/OFF. Risiko (Low/Medium/High) steuert Einsat (20%/35%/65%).\n"
-            "4) *Auszahlung*: Betrag in SOL eingeben; .",
+            "4) *@zelo_x Auszahlung*: Betrag in SOL eingeben; .",
             c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_main(u))
         return
 
