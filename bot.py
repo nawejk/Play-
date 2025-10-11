@@ -1,6 +1,6 @@
-# enhanced_app_bot.py
-# Fully improved Signals & Auto-Entry Bot — cleaned, UTF-8 safe, app-like UI, powerful admin controls
-# Note: Set environment variables: BOT_TOKEN, ADMIN_IDS (comma), CENTRAL_SOL_PUBKEY, EXCHANGE_WALLETS (optional), WITHDRAW_FEE_TIERS (optional)
+# enhanced_bot_fixed.py
+# Full, fixed bot: safe Telegram messaging, DB-backup on start, cleaned UI, admin controls, payouts, news, auto-entry.
+# IMPORTANT: Save file as UTF-8. Set env vars before running: BOT_TOKEN, ADMIN_IDS, CENTRAL_SOL_PUBKEY, EXCHANGE_WALLETS, WITHDRAW_FEE_TIERS, DB_PATH
 
 import os
 import time
@@ -15,9 +15,9 @@ import telebot
 from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, CallbackQuery
 
 # ---------------------------
-# Config / ENV
+# Configuration / ENV
 # ---------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAFjvjX2TzaGC0KHn3c1OcorBB6jmUoVv7A").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAGvDdn5u1c2cOIVVBg-fn6OVwgf2XucgqA").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable is required")
 
@@ -44,7 +44,7 @@ LAMPORTS_PER_SOL = 1_000_000_000
 MIN_SUB_SOL = float(os.getenv("MIN_SUB_SOL", "0.1"))
 
 # ---------------------------
-# Utility: price cache + formatting
+# Price cache + formatting
 # ---------------------------
 _price_cache = {"t": 0.0, "usd": 0.0}
 
@@ -348,25 +348,20 @@ def fmt_call(c) -> str:
 def kb_main(u):
     bal = fmt_sol_usdc(u["sol_balance_lamports"])
     kb = InlineKeyboardMarkup()
-    # Row 1
     kb.add(
         InlineKeyboardButton("💸 Einzahlen", callback_data="deposit"),
         InlineKeyboardButton("💳 Auszahlung", callback_data="withdraw")
     )
-    # Row 2
     kb.add(
         InlineKeyboardButton("🔔 Signale", callback_data="sub_menu"),
         InlineKeyboardButton("📰 News", callback_data="news_sub_menu")
     )
-    # Row 3
     kb.add(
         InlineKeyboardButton("⚙️ Auto-Entry", callback_data="auto_menu"),
         InlineKeyboardButton("❓ Hilfe", callback_data="help")
     )
-    # Admin tile (big)
     if is_admin(u["user_id"]):
         kb.add(InlineKeyboardButton("🛠️ Admin (Kontrolle)", callback_data="admin_menu_big"))
-    # Footer
     kb.add(InlineKeyboardButton(f"🏦 Guthaben: {bal}", callback_data="noop"))
     return kb
 
@@ -464,10 +459,14 @@ checked_signatures = set()
 
 
 def rpc(method: str, params: list, *, _retries=2, _base_sleep=0.8):
+    rpc_url = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
     for attempt in range(_retries + 1):
         try:
-            r = requests.post(CENTRAL_SOL_PUBKEY if method == "noop" else os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com"),
-                              json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params}, timeout=10)
+            r = requests.post(
+                rpc_url,
+                json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
+                timeout=10
+            )
             if r.status_code == 429:
                 sleep_s = _base_sleep * (2 ** attempt) + random.uniform(0, 0.4)
                 time.sleep(sleep_s)
@@ -627,12 +626,48 @@ def futures_place_simulated(user_id: int, base: str, side: str, leverage: str, r
 
 
 # ---------------------------
-# Bot init & states
+# Bot init & safe send wrapper
 # ---------------------------
 init_db()
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
-# transient state
+# monkeypatch send_message to be robust against bad markdown entities
+_original_send_message = bot.send_message
+
+
+def _safe_send_message(chat_id, text, **kwargs):
+    """
+    Robust send_message wrapper:
+      - If parse_mode == "Markdown", escape the text using md_escape()
+      - Try original send_message; on failure, send with no parse_mode (plain text)
+    """
+    try:
+        pm = kwargs.get("parse_mode")
+        if pm and pm.upper() == "MARKDOWN":
+            safe_text = md_escape(text)
+            kwargs_copy = dict(kwargs)
+            kwargs_copy["parse_mode"] = "Markdown"
+            return _original_send_message(chat_id, safe_text, **kwargs_copy)
+        else:
+            return _original_send_message(chat_id, text, **kwargs)
+    except Exception as e:
+        # fallback: try plain text without parse_mode
+        try:
+            kwargs_f = dict(kwargs)
+            if "parse_mode" in kwargs_f:
+                kwargs_f.pop("parse_mode")
+            return _original_send_message(chat_id, text, **kwargs_f)
+        except Exception as ex:
+            print("safe_send failed:", e, ex)
+            raise
+
+
+# override bot.send_message globally
+bot.send_message = _safe_send_message
+
+# ---------------------------
+# transient state & watcher start
+# ---------------------------
 WAITING_SOURCE_WALLET: Dict[int, bool] = {}
 WAITING_WITHDRAW_AMOUNT: Dict[int, Optional[int]] = {}
 ADMIN_AWAIT_SIMPLE_CALL: Dict[int, bool] = {}
@@ -661,7 +696,29 @@ threading.Thread(target=watcher.start, kwargs={"interval_sec": 40}, daemon=True)
 
 
 # ---------------------------
-# Home / commands / callbacks
+# Helper: DB backup check at start
+# ---------------------------
+def ensure_db_backup():
+    try:
+        if os.path.exists(DB_PATH):
+            bak = DB_PATH + ".bak." + time.strftime("%Y%m%d%H%M%S")
+            try:
+                # create quick copy backup
+                with open(DB_PATH, "rb") as fin, open(bak, "wb") as fout:
+                    fout.write(fin.read())
+                print(f"DB backup created: {bak}")
+            except Exception as e:
+                print("Backup failed:", e)
+        else:
+            print("DB does not exist yet; will be created on init.")
+    except Exception as e:
+        print("DB backup check error:", e)
+
+
+ensure_db_backup()
+
+# ---------------------------
+# Handlers: commands / callbacks / messages
 # ---------------------------
 def home_text(u) -> str:
     raw_uname = ("@" + u["username"]) if u["username"] else f"ID {u['user_id']}"
@@ -690,7 +747,7 @@ def on_cb(c: CallbackQuery):
     u = get_user(uid)
     data = c.data or ""
 
-    # --- navigation shortcuts ---
+    # navigation
     if data == "back_home":
         u = get_user(uid)
         bot.edit_message_text(home_text(u), c.message.chat.id, c.message.message_id, reply_markup=kb_main(u))
@@ -711,12 +768,12 @@ def on_cb(c: CallbackQuery):
                          parse_mode="Markdown")
         return
 
-    # --- deposit flow ---
+    # deposit
     if data == "deposit":
         if not u["source_wallet"]:
             WAITING_SOURCE_WALLET[uid] = True
             bot.answer_callback_query(c.id, "Bitte zuerst deine Absender-Wallet senden.")
-            bot.send_message(uid, "Gib jetzt deine Absender-Wallet (SOL) ein:", parse_mode="Markdown")
+            bot.send_message(uid, "Gib jetzt deine Absender-Wallet (SOL) ein:", parse_mode=None)
             return
         price = get_sol_usd()
         px = f"(1 SOL ≈ {price:.2f} USDC)" if price > 0 else ""
@@ -726,10 +783,10 @@ def on_cb(c: CallbackQuery):
     if data == "withdraw":
         WAITING_WITHDRAW_AMOUNT[uid] = None
         bot.answer_callback_query(c.id, "Bitte Betrag eingeben.")
-        bot.send_message(uid, "Gib den Betrag in SOL ein (z. B. 0.25):", parse_mode="Markdown")
+        bot.send_message(uid, "Gib den Betrag in SOL ein (z. B. 0.25):", parse_mode=None)
         return
 
-    # --- subscriptions & news ---
+    # subscriptions
     if data == "sub_menu":
         bot.edit_message_text("Abonnement-Menü:", c.message.chat.id, c.message.message_id, reply_markup=kb_sub_menu())
         return
@@ -750,6 +807,7 @@ def on_cb(c: CallbackQuery):
         bot.send_message(uid, "🔕 Dein Abonnement wurde beendet.", reply_markup=kb_main(u))
         return
 
+    # news sub
     if data.startswith("news_sub_"):
         val = data.split("_", 2)[2]
         if val == "OFF":
@@ -767,7 +825,7 @@ def on_cb(c: CallbackQuery):
         bot.edit_message_text(f"News {val} abonniert.", c.message.chat.id, c.message.message_id, reply_markup=kb_main(u))
         return
 
-    # --- auto entry ---
+    # auto menu
     if data == "auto_menu":
         bot.edit_message_text("Auto-Entry Einstellungen:", c.message.chat.id, c.message.message_id, reply_markup=kb_auto(u))
         return
@@ -790,7 +848,7 @@ def on_cb(c: CallbackQuery):
         bot.edit_message_text(f"Risiko gesetzt: *{risk}*", c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_auto(nu))
         return
 
-    # --- admin: big menu ---
+    # admin menu
     if data == "admin_menu_big":
         if not is_admin(uid):
             bot.answer_callback_query(c.id, "Nicht erlaubt.")
@@ -798,16 +856,16 @@ def on_cb(c: CallbackQuery):
         bot.edit_message_text("🛠️ Admin-Menü — Kontrolle", c.message.chat.id, c.message.message_id, reply_markup=kb_admin_main())
         return
 
-    # --- admin: create call ---
+    # admin create call
     if data == "admin_new_call":
         if not is_admin(uid):
             return
         bot.answer_callback_query(c.id)
-        bot.send_message(uid, "Sende den Call im Format:\nFUTURES|BASE|SIDE|LEV\noder\nMEME|NAME|TOKEN_ADDRESS", parse_mode="Markdown")
+        bot.send_message(uid, "Sende den Call im Format:\nFUTURES|BASE|SIDE|LEV\noder\nMEME|NAME|TOKEN_ADDRESS", parse_mode=None)
         ADMIN_AWAIT_SIMPLE_CALL[uid] = True
         return
 
-    # --- admin: broadcast last call ---
+    # admin broadcast last call
     if data == "admin_broadcast_last":
         if not is_admin(uid):
             return
@@ -829,7 +887,7 @@ def on_cb(c: CallbackQuery):
         bot.answer_callback_query(c.id, f"An {sent} Abonnenten gesendet.")
         return
 
-    # --- admin: list investors ---
+    # admin list investors
     if data == "admin_list_investors":
         if not is_admin(uid):
             return
@@ -845,7 +903,7 @@ def on_cb(c: CallbackQuery):
         bot.send_message(uid, "\n".join(parts), parse_mode="Markdown")
         return
 
-    # --- admin: view users with pagination & inline actions ---
+    # admin view users pagination
     if data.startswith("admin_view_users_"):
         if not is_admin(uid):
             return
@@ -867,11 +925,11 @@ def on_cb(c: CallbackQuery):
                    f"Source: `{r['source_wallet'] or '-'}'\n"
                    f"Auto: {r['auto_mode']} / {r['auto_risk']}\n"
                    f"News: {r['sub_types'] or '-'}")
-            bot.send_message(uid, txt, reply_markup=kb_user_row(r["user_id"]))
-        bot.send_message(uid, "Navigation:", reply_markup=kb_users_pagination(offset, total))
+            bot.send_message(uid, txt, parse_mode="Markdown", reply_markup=kb_user_row(r["user_id"]))
+        bot.send_message(uid, "Navigation:", parse_mode=None, reply_markup=kb_users_pagination(offset, total))
         return
 
-    # --- admin: balance edit direct action (via inline) ---
+    # admin inline actions
     if data.startswith("admin_balance_"):
         if not is_admin(uid):
             return
@@ -923,10 +981,10 @@ def on_cb(c: CallbackQuery):
             return
         bot.answer_callback_query(c.id)
         for r in rows:
-            bot.send_message(uid, f"#{r['id']} • {fmt_sol_usdc(r['amount_lamports'])} • {r['status']} • Lockup {r['lockup_days']}d • Fee {r['fee_percent']}%")
+            bot.send_message(uid, f"#{r['id']} • {fmt_sol_usdc(r['amount_lamports'])} • {r['status']} • Lockup {r['lockup_days']}d • Fee {r['fee_percent']}%", parse_mode=None)
         return
 
-    # --- admin: payout queue ---
+    # payout queue
     if data == "admin_payout_queue":
         if not is_admin(uid):
             return
@@ -940,11 +998,11 @@ def on_cb(c: CallbackQuery):
             txt = (f"Auszahlung #{r['id']} • {uname} (UID {r['user_id']})\n"
                    f"Betrag: {fmt_sol_usdc(r['amount_lamports'])}\n"
                    f"Lockup: {r['lockup_days']}d • Fee: {r['fee_percent']}%")
-            bot.send_message(uid, txt, reply_markup=kb_payout_manage(r["id"]))
+            bot.send_message(uid, txt, parse_mode="Markdown", reply_markup=kb_payout_manage(r["id"]))
         bot.answer_callback_query(c.id)
         return
 
-    # --- payout manage actions (approve/sent/reject) ---
+    # payout manage
     if data.startswith("payout_"):
         if not is_admin(uid):
             return
@@ -989,7 +1047,7 @@ def on_cb(c: CallbackQuery):
                 pass
         return
 
-    # --- choose payout option after amount entered ---
+    # payout options after entering amount
     if data.startswith("payoutopt_"):
         try:
             days = int(data.split("_", 1)[1])
@@ -1008,8 +1066,7 @@ def on_cb(c: CallbackQuery):
             pid = cur.lastrowid
         WAITING_WITHDRAW_AMOUNT.pop(uid, None)
         bot.answer_callback_query(c.id, "Auszahlung angefragt.")
-        bot.send_message(uid, f"Auszahlung erstellt: {fmt_sol_usdc(lam)} • Lockup: {days}d • Fee: {fee}%", parse_mode="Markdown")
-        # notify admins
+        bot.send_message(uid, f"Auszahlung erstellt: {fmt_sol_usdc(lam)} • Lockup: {days}d • Fee: {fee}%", parse_mode=None)
         for aid in ADMIN_IDS:
             try:
                 bot.send_message(int(aid), f"Neue Auszahlung #{pid} • User {uid} • {fmt_sol_usdc(lam)} • {days}d • Fee {fee}%", reply_markup=kb_payout_manage(pid))
@@ -1017,7 +1074,6 @@ def on_cb(c: CallbackQuery):
                 pass
         return
 
-    # --- fallback answer ---
     bot.answer_callback_query(c.id, "")
 
 
@@ -1039,12 +1095,12 @@ def catch_all(m: Message):
         set_source_wallet(target, wallet)
         bot.reply_to(m, f"Source-Wallet für {target} gesetzt: `{wallet}`", parse_mode="Markdown")
         try:
-            bot.send_message(target, f"Admin hat deine Source-Wallet gesetzt: `{wallet}`")
+            bot.send_message(target, f"Admin hat deine Source-Wallet gesetzt: `{wallet}`", parse_mode="Markdown")
         except Exception:
             pass
         return
 
-    # waiting for source wallet initial set
+    # initial source wallet setting
     if WAITING_SOURCE_WALLET.get(uid, False):
         WAITING_SOURCE_WALLET[uid] = False
         wallet = text
@@ -1057,7 +1113,7 @@ def catch_all(m: Message):
         bot.reply_to(m, f"✅ Absender-Wallet gespeichert.\nSende SOL von `{wallet}` an `{CENTRAL_SOL_PUBKEY}`\n{px}", parse_mode="Markdown")
         return
 
-    # admin: simple call created
+    # admin: simple call input
     if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
         ADMIN_AWAIT_SIMPLE_CALL[uid] = False
         if not is_admin(uid):
@@ -1082,7 +1138,7 @@ def catch_all(m: Message):
             bot.reply_to(m, "Formatfehler.")
         return
 
-    # admin: balance edit
+    # admin: balance edit input (after inline)
     if ADMIN_AWAIT_BALANCE_EDIT.get(uid) is not None:
         target = ADMIN_AWAIT_BALANCE_EDIT.pop(uid)
         if not is_admin(uid):
@@ -1101,7 +1157,7 @@ def catch_all(m: Message):
             nb = fmt_sol_usdc(get_balance_lamports(target))
             bot.reply_to(m, f"✅ Guthaben geändert: {target} {fmt_sol_usdc(lam)} • Neues Guthaben: {nb}")
             try:
-                bot.send_message(target, f"Admin hat dein Guthaben angepasst: {fmt_sol_usdc(lam)} • Neues Guthaben: {nb}")
+                bot.send_message(target, f"Admin hat dein Guthaben angepasst: {fmt_sol_usdc(lam)} • Neues Guthaben: {nb}", parse_mode="Markdown")
             except Exception:
                 pass
         except Exception:
@@ -1129,7 +1185,7 @@ def catch_all(m: Message):
         bot.reply_to(m, f"✅ Trade-Status gesendet an {sent} Abonnenten.")
         return
 
-    # admin: apply PnL (uses persisted stakes)
+    # admin: apply pnl
     if ADMIN_AWAIT_PNL.get(uid, False):
         ADMIN_AWAIT_PNL[uid] = False
         if not is_admin(uid):
@@ -1161,7 +1217,7 @@ def catch_all(m: Message):
         bot.reply_to(m, f"PnL angewendet an {changed} Nutzern.")
         return
 
-    # admin news flow (direct single user)
+    # admin direct send (via awaiting context)
     if ADMIN_AWAIT_NEWS_BROADCAST.get(uid):
         ctx = ADMIN_AWAIT_NEWS_BROADCAST[uid]
         step = ctx.get("step")
@@ -1189,7 +1245,7 @@ def catch_all(m: Message):
             ADMIN_AWAIT_NEWS_BROADCAST.pop(uid, None)
             return
 
-    # withdraw amount entry (user)
+    # withdraw user flow: amount entry
     if WAITING_WITHDRAW_AMOUNT.get(uid) is None:
         try:
             sol = float(text.replace(",", "."))
@@ -1207,7 +1263,7 @@ def catch_all(m: Message):
             bot.reply_to(m, "Bitte eine gültige Zahl eingeben, z. B. 0.25.")
         return
 
-    # default fallback
+    # default
     bot.reply_to(m, "Ich habe das nicht verstanden. Benutze das Menü unten.", reply_markup=kb_main(get_user(uid)))
 
 
@@ -1232,7 +1288,6 @@ def auto_executor_loop():
                     continue
                 call = get_call(r["call_id"])
                 stake_info = r["stake_lamports"] or _compute_stake_for_user(r["user_id"])
-                # simulate
                 if call["market_type"] == "FUTURES":
                     result = futures_place_simulated(r["user_id"], call["base"], call["side"], call["leverage"], r["auto_risk"])
                 else:
@@ -1276,5 +1331,5 @@ def payout_reminder_loop():
 threading.Thread(target=auto_executor_loop, daemon=True).start()
 threading.Thread(target=payout_reminder_loop, daemon=True).start()
 
-print("Bot läuft — enhanced app-like UI.")
+print("Bot läuft — fixed & safe.")
 bot.infinity_polling(timeout=60, long_polling_timeout=60)
