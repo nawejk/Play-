@@ -1455,7 +1455,7 @@ def auto_executor_loop():
                     con.execute("UPDATE executions SET status=?, txid=?, message=? WHERE id=?", (status, txid, "JOINED", r["eid"]))
                 try:
                     simtxt = " (Live)" if SIMULATION_MODE else ""
-                    bot.send_message(r["user_id"], f"🤖 Auto-Entry{} • {r['auto_risk']}\n{fmt_call(call)}\nStatus: *{status}*\nEinsatz (Info): {fmt_sol_usdc(stake_info)}\nGuthaben: {fmt_sol_usdc(get_balance_lamports(r['user_id']))}\n`{txid}`", parse_mode="Markdown")
+                    bot.send_message(r["user_id"], f"🤖 Auto-Entry • {r['auto_risk']}\n{fmt_call(call)}\nStatus: *{status}*\nEinsatz (Info): {fmt_sol_usdc(stake_info)}\nGuthaben: {fmt_sol_usdc(get_balance_lamports(r['user_id']))}\n`{txid}`", parse_mode="Markdown")
                 except Exception:
                     pass
         except Exception as e:
