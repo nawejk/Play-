@@ -745,7 +745,7 @@ def home_text(u) -> str:
         "• Einzahlungen & automatisches Gutschreiben (nur verifizierte Source-Wallets)\n"
         "• Signale für *Meme* & *Futures* — abonnierbar einzeln oder kombiniert\n"
         "• Auto-Entry mit *Low/Medium/High*-Einstellungen (transparente Einsatz-Regeln)\n"
-        f"• Referral-Programm: https://t.me/{@alphafutures1_bot}?start={refcode}\n\n"
+        f"• Referral-Programm: https://t.me/{alphafutures1_bot}?start={refcode}\n\n"
         f"🏦 Aktuelles Guthaben: *{bal}*\n"
         "📩 Support: Nutze /support oder kontaktiere einen Admin direkt\n\n"
         "Hinweis: Systemmeldungen sind transparent — prüfe bitte alle Aktionen vor Auszahlung."
@@ -896,7 +896,7 @@ def on_cb(c: CallbackQuery):
         set_referral(uid, code)
         bot.answer_callback_query(c.id, "Referral-Code")
         # replace <YourBotUsername> manually if needed
-        bot.send_message(uid, f"Dein Referral-Link: `https://t.me/<@alphafutures1_bot>?start={code}`\nTeile ihn mit Freunden!", parse_mode="Markdown")
+        bot.send_message(uid, f"Dein Referral-Link: `https://t.me/<alphafutures1_bot>?start={code}`\nTeile ihn mit Freunden!", parse_mode="Markdown")
         return
 
     # portfolio
