@@ -27,7 +27,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, C
 # ---------------------------
 # Configuration (ENV)
 # ---------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAE_OZ0fv_ZvfjJF28dUVMzqPlyB1FgkzZA").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAGpyblCVKh8Z_5IYYBqm_7ohDCNlcs8k8g").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable required")
 
