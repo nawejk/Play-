@@ -733,7 +733,7 @@ ensure_db_backup()
 # ---------------------------
 def home_text(u) -> str:
     """Schöner, professioneller Willkommenstext im App-Stil."""
-    raw_uname = ("@" + u["username"]) if u.get("username") else f"ID {u['user_id']}"
+    raw_uname = ("@" + u["username"]) if u["username"] else f"ID {u['user_id']}"
     uname = md_escape(raw_uname)
     bal = fmt_sol_usdc(u.get("sol_balance_lamports", 0))
     refcode = u.get("refcode", "REF12345")
