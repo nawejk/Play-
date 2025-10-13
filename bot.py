@@ -1,16 +1,5 @@
-# enhanced_bot_full.py
+# bot.py
 # UTF-8
-# Features:
-# - Admin panel: view/paginate users, change balances, set wallets, broadcast messages/photos
-# - Referral system with transparent bonuses
-# - Portfolio view
-# - Support messaging (admin -> user)
-# - News subscriptions (MEME/FUTURES/BOTH)
-# - Withdraw lockup/fee tiers
-# - Import balances from pasted list (admin-only)
-# - Apply PnL / Promo distribution (admin)
-# - Safe Markdown on dynamic vars to avoid parse errors
-# - Simulated trading functions (replace with live integrations when ready)
 
 import os
 import time
@@ -27,16 +16,22 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, C
 # ---------------------------
 # Configuration (ENV)
 # ---------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAHQD0P7kOcriwpzxLGXR60Y_VtDpnldLHM").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAF1IatYvpNub_6-gKcZnigYMebzcz6Ju3Y").strip()
 if not BOT_TOKEN:
+    # Fallback – setze deinen Token per ENV
+    BOT_TOKEN = "REPLACE_WITH_YOUR_BOT_TOKEN"
+if not BOT_TOKEN or BOT_TOKEN == "REPLACE_WITH_YOUR_BOT_TOKEN":
     raise RuntimeError("BOT_TOKEN environment variable required")
 
 ADMIN_IDS = [a.strip() for a in os.getenv("ADMIN_IDS", "8076025426").split(",") if a.strip()]
+SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com").strip()
 CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "3wyVwpcbWt96mphJjskFsR2qoyafqJuSfGZYmiipW4oy").strip()
+
+# Liste bekannter Exchange-Absender (optional, CSV in ENV)
 EXCHANGE_WALLETS = set([s.strip() for s in os.getenv("EXCHANGE_WALLETS", "").split(",") if s.strip()])
 
-# Withdraw fee tiers (lockup_days: fee_percent), default: 5->10%, 7->7.5%, 10->5%
-DEFAULT_FEE_TIERS = {5: 10.0, 7: 7.5, 10: 5.0}
+# Withdraw fee tiers (lockup_days: fee_percent), default: 5->20%, 7->10%, 10->5%
+DEFAULT_FEE_TIERS = {5: 20.0, 7: 10.0, 10: 5.0}
 _fee_tiers: Dict[int, float] = {}
 raw_tiers = os.getenv("WITHDRAW_FEE_TIERS", "")
 if raw_tiers:
@@ -53,7 +48,7 @@ DB_PATH = os.getenv("DB_PATH", "memebot_full.db")
 LAMPORTS_PER_SOL = 1_000_000_000
 MIN_SUB_SOL = float(os.getenv("MIN_SUB_SOL", "0.1"))
 
-# Simulation flag. Default True. Set False when real integrations are added.
+# Simulation flag – echte Trading-Integrationen später hinzufügen
 SIMULATION_MODE = True
 
 # ---------------------------
@@ -77,11 +72,11 @@ def get_sol_usd() -> float:
     return _price_cache["usd"] or 0.0
 
 def fmt_sol_usdc(lamports_or_int: int) -> str:
-    lam = int(lamports_or_int)
+    lam = int(lamports_or_int or 0)
     sol = lam / LAMPORTS_PER_SOL
     usd = get_sol_usd()
     if usd > 0:
-        return f"{sol:.6f} SOL (~{sol * usd:.2f} USDC)"
+        return f"{sol:.6f} SOL (~{sol*usd:.2f} USDC)"
     return f"{sol:.6f} SOL"
 
 def parse_fee_tiers() -> List[Tuple[int, float]]:
@@ -175,10 +170,8 @@ def init_db():
             "ALTER TABLE payouts ADD COLUMN fee_percent REAL DEFAULT 0.0",
             "ALTER TABLE users ADD COLUMN referral_code TEXT DEFAULT ''"
         ]:
-            try:
-                con.execute(stmt)
-            except Exception:
-                pass
+            try: con.execute(stmt)
+            except Exception: pass
 
 # ---------------------------
 # Misc helpers
@@ -187,10 +180,23 @@ def md_escape(text: str) -> str:
     if not isinstance(text, str):
         return ""
     return (text.replace('\\', '\\\\')
-            .replace('_', '\\_')
-            .replace('*', '\\*')
-            .replace('`', '\\`')
-            .replace('[', '\\['))
+                .replace('_', '\\_')
+                .replace('*', '\\*')
+                .replace('`', '\\`')
+                .replace('[', '\\['))
+
+def row_get(row, key, default=None):
+    """Safe access for sqlite3.Row and dict."""
+    if row is None:
+        return default
+    try:
+        # sqlite3.Row
+        return row[key] if key in row.keys() else default
+    except Exception:
+        try:
+            return row.get(key, default)  # dict
+        except Exception:
+            return default
 
 def is_admin(user_id: int) -> bool:
     return str(user_id) in ADMIN_IDS
@@ -208,13 +214,6 @@ def gen_referral_for_user(user_id: int) -> str:
     import hashlib
     h = hashlib.sha1(str(user_id).encode()).hexdigest()[:8]
     return f"REF{h.upper()}"
-
-def row_get(row: sqlite3.Row, key: str, default=None):
-    try:
-        v = row[key]
-        return v if v is not None else default
-    except Exception:
-        return default
 
 # ---------------------------
 # CRUD & business logic
@@ -244,7 +243,7 @@ def get_subscription_types(user_id: int) -> List[str]:
     u = get_user(user_id)
     if not u:
         return []
-    st = row_get(u, "sub_types", "") or ""
+    st = row_get(u, "sub_types", "")
     if not st:
         return []
     return [s for s in st.split(",") if s]
@@ -276,7 +275,7 @@ def set_balance(user_id: int, lamports: int):
 def subtract_balance(user_id: int, lamports: int) -> bool:
     with get_db() as con:
         row = con.execute("SELECT sol_balance_lamports FROM users WHERE user_id=?", (user_id,)).fetchone()
-        bal = row["sol_balance_lamports"] if row else 0
+        bal = row_get(row, "sol_balance_lamports", 0)
         if bal < lamports:
             return False
         con.execute("UPDATE users SET sol_balance_lamports = sol_balance_lamports - ? WHERE user_id=?", (lamports, user_id))
@@ -285,7 +284,7 @@ def subtract_balance(user_id: int, lamports: int) -> bool:
 def get_balance_lamports(user_id: int) -> int:
     with get_db() as con:
         row = con.execute("SELECT sol_balance_lamports FROM users WHERE user_id=?", (user_id,)).fetchone()
-        return row["sol_balance_lamports"] if row else 0
+        return row_get(row, "sol_balance_lamports", 0)
 
 def list_investors(limit: int = 50, offset: int = 0):
     with get_db() as con:
@@ -324,7 +323,7 @@ def _compute_stake_for_user(user_id: int) -> int:
     if not u:
         return 0
     frac = _risk_fraction(row_get(u, "auto_risk", "MEDIUM"))
-    bal = row_get(u, "sol_balance_lamports", 0) or 0
+    bal = row_get(u, "sol_balance_lamports", 0)
     stake = max(int(bal * frac), int(0.01 * LAMPORTS_PER_SOL))
     return stake
 
@@ -339,19 +338,19 @@ def queue_execution(call_id: int, user_id: int, status: str = "QUEUED", message:
         return cur.lastrowid
 
 def fmt_call(c) -> str:
-    if c["market_type"] == "FUTURES":
-        core = f"Futures • {c['base']} • {c['side']} {c['leverage'] or ''}".strip()
+    if row_get(c, "market_type") == "FUTURES":
+        core = f"Futures • {row_get(c,'base','?')} • {row_get(c,'side','?')} {row_get(c,'leverage','')}".strip()
     else:
-        core = f"Meme • {c['base']}"
-    extra = f"\nToken: `{c['token_address']}`" if (c["market_type"] == "MEME" and c["token_address"]) else ""
-    note = f"\nNotes: {md_escape(c['notes'])}" if c["notes"] else ""
+        core = f"Meme • {row_get(c,'base','?')}"
+    extra = f"\nToken: `{md_escape(row_get(c,'token_address',''))}`" if (row_get(c,"market_type") == "MEME" and row_get(c,"token_address")) else ""
+    note = f"\nNotes: {md_escape(row_get(c,'notes',''))}" if row_get(c,"notes") else ""
     return f"🧩 *{core}*{extra}{note}"
 
 # ---------------------------
 # Keyboards
 # ---------------------------
 def kb_main(u):
-    bal = fmt_sol_usdc(u["sol_balance_lamports"])
+    bal = fmt_sol_usdc(row_get(u, "sol_balance_lamports", 0))
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("💸 Einzahlen", callback_data="deposit"),
            InlineKeyboardButton("💳 Auszahlung", callback_data="withdraw"))
@@ -361,7 +360,7 @@ def kb_main(u):
            InlineKeyboardButton("❓ Hilfe", callback_data="help"))
     kb.add(InlineKeyboardButton("🔗 Referral", callback_data="referral"),
            InlineKeyboardButton("📈 Mein Portfolio", callback_data="my_portfolio"))
-    if is_admin(u["user_id"]):
+    if is_admin(row_get(u, "user_id", 0)):
         kb.add(InlineKeyboardButton("🛠️ Admin (Kontrolle)", callback_data="admin_menu_big"))
     kb.add(InlineKeyboardButton(f"🏦 Guthaben: {bal}", callback_data="noop"))
     return kb
@@ -401,7 +400,7 @@ def kb_admin_main(page: int = 0):
     kb.add(InlineKeyboardButton("💬 News senden", callback_data="admin_news_send"))
     kb.add(InlineKeyboardButton("💼 Guthaben ändern", callback_data="admin_balance_edit"))
     kb.add(InlineKeyboardButton("📤 Broadcast an alle", callback_data="admin_broadcast_all"))
-    kb.add(InlineKeyboardButton("🔧 Promotions / PnL (Admin)", callback_data="admin_apply_pnl"))
+    kb.add(InlineKeyboardButton("🔧 Promotions / PnL", callback_data="admin_apply_pnl"))
     kb.add(InlineKeyboardButton("⬅️ Zurück", callback_data="back_home"))
     return kb
 
@@ -428,7 +427,7 @@ def kb_withdraw_options():
     kb = InlineKeyboardMarkup()
     for days, pct in parse_fee_tiers():
         kb.add(InlineKeyboardButton(f"{days} Tage • Fee {pct}%", callback_data=f"payoutopt_{days}"))
-    kb.add(InlineKeyboardButton("Abbrechen", callback_data="back_home"))
+    kb.add(InlineKeyboardButton("↩️ Abbrechen", callback_data="back_home"))
     return kb
 
 def kb_payout_manage(pid: int):
@@ -444,11 +443,10 @@ def kb_payout_manage(pid: int):
 checked_signatures = set()
 
 def rpc(method: str, params: list, *, _retries=2, _base_sleep=0.8):
-    rpc_url = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com")
     for attempt in range(_retries + 1):
         try:
             r = requests.post(
-                rpc_url,
+                SOLANA_RPC,
                 json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params},
                 timeout=10
             )
@@ -560,7 +558,7 @@ class CentralWatcher:
             return
         with get_db() as con:
             rows = con.execute("SELECT user_id, source_wallet FROM users WHERE source_wallet IS NOT NULL").fetchall()
-        src_map = {r["source_wallet"]: r["user_id"] for r in rows if r["source_wallet"]}
+        src_map = {row_get(r, "source_wallet"): row_get(r, "user_id") for r in rows if row_get(r, "source_wallet")}
         for sig in sigs:
             if self._is_seen(sig):
                 checked_signatures.add(sig)
@@ -586,7 +584,7 @@ class CentralWatcher:
                 if sender in EXCHANGE_WALLETS:
                     for aid in ADMIN_IDS:
                         try:
-                            bot.send_message(int(aid), f"⚠️ Sender als Exchange-Wallet gelistet: `{md_escape(sender)}`", parse_mode="Markdown")
+                            bot.send_message(int(aid), f"⚠️ Sender ist als Exchange-Wallet gelistet: `{md_escape(sender)}`", parse_mode="Markdown")
                         except Exception:
                             pass
                 continue
@@ -604,10 +602,55 @@ def futures_place_simulated(user_id: int, base: str, side: str, leverage: str, r
     return {"status": "FILLED", "order_id": f"Live-FUT-{base}-{int(time.time())}", "base": base}
 
 # ---------------------------
-# Bot init
+# Bot init & safe send wrappers
 # ---------------------------
 init_db()
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
+
+# Safe sender: versuche unescaped; bei Fehler → escapen; letzter Versuch ohne parse_mode
+_original_send_message = bot.send_message
+def _safe_send_message(chat_id, text, **kwargs):
+    try:
+        return _original_send_message(chat_id, text, **kwargs)
+    except Exception:
+        pm = kwargs.get("parse_mode")
+        if pm and str(pm).upper().startswith("MARKDOWN"):
+            kwargs2 = dict(kwargs)
+            kwargs2["parse_mode"] = "Markdown"
+            try:
+                return _original_send_message(chat_id, md_escape(str(text)), **kwargs2)
+            except Exception:
+                kwargs3 = dict(kwargs2)
+                kwargs3.pop("parse_mode", None)
+                return _original_send_message(chat_id, str(text), **kwargs3)
+        else:
+            kwargs3 = dict(kwargs)
+            kwargs3.pop("parse_mode", None)
+            return _original_send_message(chat_id, str(text), **kwargs3)
+
+bot.send_message = _safe_send_message
+
+_original_edit_message_text = bot.edit_message_text
+def _safe_edit_message_text(text, chat_id, message_id, **kwargs):
+    try:
+        return _original_edit_message_text(text, chat_id, message_id, **kwargs)
+    except Exception:
+        pm = kwargs.get("parse_mode")
+        if pm and str(pm).upper().startswith("MARKDOWN"):
+            kwargs2 = dict(kwargs)
+            kwargs2["parse_mode"] = "Markdown"
+            try:
+                return _original_edit_message_text(md_escape(str(text)), chat_id, message_id, **kwargs2)
+            except Exception:
+                kwargs3 = dict(kwargs2)
+                kwargs3.pop("parse_mode", None)
+                return _original_edit_message_text(str(text), chat_id, message_id, **kwargs3)
+        else:
+            kwargs3 = dict(kwargs)
+            kwargs3.pop("parse_mode", None)
+            return _original_edit_message_text(str(text), chat_id, message_id, **kwargs3)
+
+bot.edit_message_text = _safe_edit_message_text
 
 # transient state
 WAITING_SOURCE_WALLET: Dict[int, bool] = {}
@@ -656,41 +699,38 @@ def ensure_db_backup():
 ensure_db_backup()
 
 # ---------------------------
-# Helpers: bot username cache
+# Home text (Wunschformat)
 # ---------------------------
-_BOT_USERNAME_CACHE = None
-def get_bot_username() -> str:
-    global _BOT_USERNAME_CACHE
-    if not _BOT_USERNAME_CACHE:
-        try:
-            _BOT_USERNAME_CACHE = bot.get_me().username
-        except Exception:
-            _BOT_USERNAME_CACHE = "YourBotUsername"
-    return _BOT_USERNAME_CACHE
+def get_bot_username():
+    try:
+        me = bot.get_me()
+        return me.username or "<YourBotUsername>"
+    except Exception:
+        return "<YourBotUsername>"
 
-# ---------------------------
-# Handlers: /start, callbacks, messages
-# ---------------------------
 def home_text(u) -> str:
-    """Schöner, professioneller Willkommenstext im App-Stil."""
-    raw_uname = ("@" + u["username"]) if u["username"] else f"ID {u['user_id']}"
+    raw_uname = ("@" + row_get(u, "username", "")) if row_get(u, "username") else f"ID {row_get(u, 'user_id','?')}"
     uname = md_escape(raw_uname)
     bal = fmt_sol_usdc(row_get(u, "sol_balance_lamports", 0))
-    refcode = row_get(u, "referral_code", None) or gen_referral_for_user(u["user_id"])
+    refcode = row_get(u, "referral_code") or gen_referral_for_user(row_get(u, "user_id"))
     bot_username = get_bot_username()
-
+    ref_link = f"https://t.me/{bot_username}?start={refcode}"
+    ref_link_md = f"`{md_escape(ref_link)}`"
     return (
         f"👋 Hallo {uname} — willkommen!\n\n"
         "Dieses System bietet:\n"
-        "• Einzahlungen & automatisches Gutschreiben (nur verifizierte Source-Wallets)\n"
-        "• Signale für *Meme* & *Futures* — abonnierbar einzeln oder kombiniert\n"
-        "• Auto-Entry mit *Low/Medium/High*-Einstellungen (transparente Einsatz-Regeln)\n"
-        f"• Referral-Programm: https://t.me/{bot_username}?start={refcode}\n\n"
-        f"🏦 Aktuelles Guthaben: *{bal}*\n"
+        "• Einzahlungen & automatisches Gutschreiben (nur verifizierte Source-Wallets)  \n"
+        "• Signale für Meme & Futures — abonnierbar einzeln oder kombiniert  \n"
+        "• Auto-Entry mit Low/Medium/High-Einstellungen (transparente Einsatz-Regeln)  \n"
+        f"• Referral-Programm: {ref_link_md}\n\n"
+        f"🏦 Aktuelles Guthaben: *{bal}*  \n"
         "📩 Support: Nutze /support oder kontaktiere einen Admin direkt\n\n"
         "Hinweis: Systemmeldungen sind transparent — prüfe bitte alle Aktionen vor Auszahlung."
     )
 
+# ---------------------------
+# Handlers
+# ---------------------------
 @bot.message_handler(commands=["start"])
 def cmd_start(m: Message):
     uid = m.from_user.id
@@ -698,7 +738,7 @@ def cmd_start(m: Message):
     admin_flag = 1 if is_admin(uid) else 0
     upsert_user(uid, uname, admin_flag)
 
-    # Referral handling: /start REFxxxxx or /start=REFxxxx
+    # Referral payload (/start CODE oder /start=CODE)
     ref_code = None
     txt = (m.text or "")
     parts = txt.split()
@@ -709,29 +749,27 @@ def cmd_start(m: Message):
 
     if ref_code:
         with get_db() as con:
-            row = con.execute("SELECT user_id FROM users WHERE referral_code=?", (ref_code,)).fetchone()
-        if row and row["user_id"] != uid:
-            referrer = int(row["user_id"])
-            bonus_sol = 0.01
-            bonus_lam = int(bonus_sol * LAMPORTS_PER_SOL)
+            ref_row = con.execute("SELECT user_id FROM users WHERE referral_code=?", (ref_code,)).fetchone()
+        referrer = row_get(ref_row, "user_id")
+        if referrer and referrer != uid:
+            bonus_lam = int(0.01 * LAMPORTS_PER_SOL)  # 0.01 SOL Bonus
             add_balance(referrer, bonus_lam)
             add_balance(uid, bonus_lam)
             try:
-                bot.send_message(referrer, f"🎉 Dein Referral {md_escape(ref_code)} wurde verwendet! Du erhältst {bonus_sol} SOL Bonus.", parse_mode="Markdown")
+                bot.send_message(referrer, f"🎉 Dein Referral {md_escape(ref_code)} wurde verwendet! Bonus: {fmt_sol_usdc(bonus_lam)}")
             except Exception:
                 pass
             try:
-                bot.send_message(uid, f"🎉 Willkommen! Du und der Referrer bekommen je {bonus_sol} SOL Bonus.", parse_mode="Markdown")
+                bot.send_message(uid, f"🎉 Willkommen! Du und der Referrer bekommen je {fmt_sol_usdc(bonus_lam)} Bonus.")
             except Exception:
                 pass
 
     # ensure referral code exists
     u = get_user(uid)
-    if u and not (row_get(u, "referral_code", "").strip()):
-        code = gen_referral_for_user(uid)
-        set_referral(uid, code)
+    if not row_get(u, "referral_code"):
+        set_referral(uid, gen_referral_for_user(uid))
+        u = get_user(uid)
 
-    u = get_user(uid)
     bot.reply_to(m, home_text(u), reply_markup=kb_main(u))
 
 @bot.callback_query_handler(func=lambda c: True)
@@ -741,8 +779,7 @@ def on_cb(c: CallbackQuery):
     data = c.data or ""
 
     if data == "back_home":
-        u = get_user(uid)
-        bot.edit_message_text(home_text(u), c.message.chat.id, c.message.message_id, reply_markup=kb_main(u))
+        bot.edit_message_text(home_text(u), c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_main(u))
         return
 
     if data == "noop":
@@ -762,7 +799,7 @@ def on_cb(c: CallbackQuery):
 
     # deposit
     if data == "deposit":
-        if not row_get(u, "source_wallet", None):
+        if not row_get(u, "source_wallet"):
             WAITING_SOURCE_WALLET[uid] = True
             bot.answer_callback_query(c.id, "Bitte zuerst deine Absender-Wallet senden.")
             bot.send_message(uid, "Gib jetzt deine Absender-Wallet (SOL) ein:", parse_mode=None)
@@ -772,9 +809,11 @@ def on_cb(c: CallbackQuery):
         bot.edit_message_text(
             f"Absender-Wallet: `{md_escape(row_get(u,'source_wallet','-'))}`\n"
             f"Sende SOL an: `{md_escape(CENTRAL_SOL_PUBKEY)}`\n{px}",
-            c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_main(u))
+            c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_main(u)
+        )
         return
 
+    # withdraw
     if data == "withdraw":
         WAITING_WITHDRAW_AMOUNT[uid] = None
         bot.answer_callback_query(c.id, "Bitte Betrag eingeben.")
@@ -803,6 +842,10 @@ def on_cb(c: CallbackQuery):
         return
 
     # news sub
+    if data == "news_sub_menu":
+        bot.edit_message_text("News-Kategorien:", c.message.chat.id, c.message.message_id, reply_markup=kb_news_sub())
+        return
+
     if data.startswith("news_sub_"):
         val = data.split("_", 2)[2]
         if val == "OFF":
@@ -823,27 +866,21 @@ def on_cb(c: CallbackQuery):
     # referral
     if data == "referral":
         u = get_user(uid)
-        code = row_get(u, "referral_code", None) or gen_referral_for_user(uid)
+        code = row_get(u, "referral_code") or gen_referral_for_user(uid)
         set_referral(uid, code)
-        bot.answer_callback_query(c.id, "Referral-Link")
-        bot.send_message(uid, f"Dein Referral-Link: `https://t.me/{get_bot_username()}?start={md_escape(code)}`\nTeile ihn mit Freunden!", parse_mode="Markdown")
+        bot_username = get_bot_username()
+        link = f"https://t.me/{bot_username}?start={code}"
+        bot.answer_callback_query(c.id, "Referral-Link erstellt")
+        bot.send_message(uid, f"Dein Referral-Link: `{md_escape(link)}`\nTeile ihn mit Freunden!", parse_mode="Markdown")
         return
 
     # portfolio
     if data == "my_portfolio":
         u = get_user(uid)
         bal = fmt_sol_usdc(row_get(u, "sol_balance_lamports", 0))
-        refs = 0
-        try:
-            with get_db() as con:
-                rc = row_get(u, "referral_code", "")
-                if rc:
-                    refs = con.execute("SELECT COUNT(*) as c FROM users WHERE referral_code=? AND user_id!=?", (rc, uid)).fetchone()["c"]
-        except Exception:
-            refs = 0
-        subs = row_get(u, "sub_types", "-") or "-"
+        subs = row_get(u, "sub_types", "-")
         bot.answer_callback_query(c.id, "Portfolio")
-        bot.send_message(uid, f"🏦 Guthaben: *{bal}*\n🔁 Referrals: *{refs}*\n📰 News-Abos: *{md_escape(subs)}*\nAuto: *{md_escape(row_get(u,'auto_mode','OFF'))} / {md_escape(row_get(u,'auto_risk','MEDIUM'))}*", parse_mode="Markdown")
+        bot.send_message(uid, f"🏦 Guthaben: *{bal}*\n📰 News-Abos: *{subs}*\nAuto: *{row_get(u,'auto_mode','OFF')} / {row_get(u,'auto_risk','MEDIUM')}*", parse_mode="Markdown")
         return
 
     # auto menu
@@ -858,7 +895,7 @@ def on_cb(c: CallbackQuery):
         set_auto_mode(uid, mode)
         bot.answer_callback_query(c.id, f"Auto-Entry: {mode}")
         nu = get_user(uid)
-        bot.edit_message_text(f"Auto-Entry gesetzt: *{md_escape(mode)}*", c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_auto(nu))
+        bot.edit_message_text(f"Auto-Entry gesetzt: *{mode}*", c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_auto(nu))
         return
 
     if data.startswith("risk_"):
@@ -866,7 +903,7 @@ def on_cb(c: CallbackQuery):
         set_auto_risk(uid, risk)
         bot.answer_callback_query(c.id, f"Risk: {risk}")
         nu = get_user(uid)
-        bot.edit_message_text(f"Risiko gesetzt: *{md_escape(risk)}*", c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_auto(nu))
+        bot.edit_message_text(f"Risiko gesetzt: *{risk}*", c.message.chat.id, c.message.message_id, parse_mode="Markdown", reply_markup=kb_auto(nu))
         return
 
     # admin menu
@@ -899,7 +936,7 @@ def on_cb(c: CallbackQuery):
         for su in subs:
             try:
                 bot.send_message(su, msg, parse_mode="Markdown")
-                queue_execution(row["id"], su, status="QUEUED", message="Queued by broadcast")
+                queue_execution(row_get(row,"id"), su, status="QUEUED", message="Queued by broadcast")
                 sent += 1
             except Exception:
                 pass
@@ -915,8 +952,8 @@ def on_cb(c: CallbackQuery):
             return
         parts = ["👥 Investoren (Top)"]
         for r in rows:
-            name = "@" + r["username"] if r["username"] else "(kein Username)"
-            parts.append(f"- {md_escape(name)} • {fmt_sol_usdc(r['sol_balance_lamports'])} • News: {md_escape(r['sub_types'] or '-')}")
+            name = "@" + row_get(r, "username","") if row_get(r,"username") else "(kein Username)"
+            parts.append(f"- {name} • {fmt_sol_usdc(row_get(r,'sol_balance_lamports',0))} • News: {row_get(r,'sub_types','-')}")
         bot.answer_callback_query(c.id)
         bot.send_message(uid, "\n".join(parts), parse_mode="Markdown")
         return
@@ -930,19 +967,24 @@ def on_cb(c: CallbackQuery):
             offset = 0
         with get_db() as con:
             total = con.execute("SELECT COUNT(*) as cnt FROM users").fetchone()["cnt"]
-            rows = con.execute("SELECT user_id, username, sol_balance_lamports, source_wallet, auto_mode, auto_risk, sub_types FROM users ORDER BY sol_balance_lamports DESC LIMIT 10 OFFSET ?", (offset,)).fetchall()
+            rows = con.execute("""
+                SELECT user_id, username, sol_balance_lamports, source_wallet, auto_mode, auto_risk, sub_types
+                FROM users
+                ORDER BY sol_balance_lamports DESC
+                LIMIT 10 OFFSET ?
+            """, (offset,)).fetchall()
         if not rows:
             bot.answer_callback_query(c.id, "Keine Nutzer.")
             return
         bot.answer_callback_query(c.id)
         for r in rows:
-            uname = "@" + (r["username"] or "") if r["username"] else "(kein Username)"
-            txt = (f"{md_escape(uname)} • UID {r['user_id']}\n"
-                   f"Guthaben: {fmt_sol_usdc(r['sol_balance_lamports'])}\n"
-                   f"Source: `{md_escape(r['source_wallet'] or '-')}`\n"
-                   f"Auto: {md_escape(r['auto_mode'])} / {md_escape(r['auto_risk'])}\n"
-                   f"News: {md_escape(r['sub_types'] or '-')}")
-            bot.send_message(uid, txt, parse_mode="Markdown", reply_markup=kb_user_row(r["user_id"]))
+            uname = "@" + row_get(r,"username","") if row_get(r,"username") else "(kein Username)"
+            txt = (f"{uname} • UID {row_get(r,'user_id')}\n"
+                   f"Guthaben: {fmt_sol_usdc(row_get(r,'sol_balance_lamports',0))}\n"
+                   f"Source: `{md_escape(row_get(r,'source_wallet','-'))}`\n"
+                   f"Auto: {row_get(r,'auto_mode','OFF')} / {row_get(r,'auto_risk','MEDIUM')}\n"
+                   f"News: {row_get(r,'sub_types','-')}")
+            bot.send_message(uid, txt, parse_mode="Markdown", reply_markup=kb_user_row(row_get(r,"user_id")))
         bot.send_message(uid, "Navigation:", parse_mode=None, reply_markup=kb_users_pagination(offset, total))
         return
 
@@ -994,7 +1036,7 @@ def on_cb(c: CallbackQuery):
             return
         bot.answer_callback_query(c.id)
         for r in rows:
-            bot.send_message(uid, f"#{r['id']} • {fmt_sol_usdc(r['amount_lamports'])} • {r['status']} • Lockup {r['lockup_days']}d • Fee {r['fee_percent']}%", parse_mode=None)
+            bot.send_message(uid, f"#{row_get(r,'id')} • {fmt_sol_usdc(row_get(r,'amount_lamports',0))} • {row_get(r,'status','-')} • Lockup {row_get(r,'lockup_days',0)}d • Fee {row_get(r,'fee_percent',0)}%", parse_mode=None)
         return
 
     if data == "admin_broadcast_all":
@@ -1012,11 +1054,11 @@ def on_cb(c: CallbackQuery):
             bot.answer_callback_query(c.id, "Keine offenen Auszahlungen.")
             return
         for r in rows:
-            uname = "@" + (r["username"] or "") if r["username"] else "(kein Username)"
-            txt = (f"Auszahlung #{r['id']} • {md_escape(uname)} (UID {r['user_id']})\n"
-                   f"Betrag: {fmt_sol_usdc(r['amount_lamports'])}\n"
-                   f"Lockup: {r['lockup_days']}d • Fee: {r['fee_percent']}%")
-            bot.send_message(uid, txt, parse_mode="Markdown", reply_markup=kb_payout_manage(r["id"]))
+            uname = "@" + (row_get(r,"username","") or "") if row_get(r,"username") else "(kein Username)"
+            txt = (f"Auszahlung #{row_get(r,'id')} • {uname} (UID {row_get(r,'user_id')})\n"
+                   f"Betrag: {fmt_sol_usdc(row_get(r,'amount_lamports',0))}\n"
+                   f"Lockup: {row_get(r,'lockup_days',0)}d • Fee: {row_get(r,'fee_percent',0)}%")
+            bot.send_message(uid, txt, parse_mode="Markdown", reply_markup=kb_payout_manage(row_get(r,"id")))
         bot.answer_callback_query(c.id)
         return
 
@@ -1042,7 +1084,7 @@ def on_cb(c: CallbackQuery):
                 con.execute("UPDATE payouts SET status='APPROVED' WHERE id=?", (pid,))
             bot.answer_callback_query(c.id, "Genehmigt.")
             try:
-                bot.send_message(row["user_id"], "✅ Deine Auszahlung wurde genehmigt. Admin wird die Zahlung durchführen.")
+                bot.send_message(row_get(row,"user_id"), "✅ Deine Auszahlung wurde genehmigt. Admin wird die Zahlung durchführen.")
             except Exception:
                 pass
         elif action == "SENT":
@@ -1050,7 +1092,7 @@ def on_cb(c: CallbackQuery):
                 con.execute("UPDATE payouts SET status='SENT' WHERE id=?", (pid,))
             bot.answer_callback_query(c.id, "Als gesendet markiert.")
             try:
-                bot.send_message(row["user_id"], "📤 Deine Auszahlung wurde als gesendet markiert.")
+                bot.send_message(row_get(row,"user_id"), "📤 Deine Auszahlung wurde als gesendet markiert.")
             except Exception:
                 pass
         elif action == "REJECT":
@@ -1058,7 +1100,7 @@ def on_cb(c: CallbackQuery):
                 con.execute("UPDATE payouts SET status='REJECTED' WHERE id=?", (pid,))
             bot.answer_callback_query(c.id, "Abgelehnt.")
             try:
-                bot.send_message(row["user_id"], "❌ Deine Auszahlung wurde abgelehnt.")
+                bot.send_message(row_get(row,"user_id"), "❌ Deine Auszahlung wurde abgelehnt.")
             except Exception:
                 pass
         return
@@ -1069,7 +1111,7 @@ def on_cb(c: CallbackQuery):
         except Exception:
             bot.answer_callback_query(c.id, "Ungültig")
             return
-        fee = float(_fee_tiers.get(days, DEFAULT_FEE_TIERS.get(days, 0.0)))
+        fee = float(_fee_tiers.get(days, DEFAULT_FEE_Tiers.get(days, 0.0))) if False else float(_fee_tiers.get(days, 0.0))
         pending = WAITING_WITHDRAW_AMOUNT.get(uid)
         if not pending or pending <= 0:
             bot.answer_callback_query(c.id, "Keine ausstehende Auszahlung.")
@@ -1095,7 +1137,7 @@ def on_cb(c: CallbackQuery):
             bot.answer_callback_query(c.id, "Nicht erlaubt.")
             return
         ADMIN_AWAIT_PNL[uid] = True
-        bot.answer_callback_query(c.id, "Sende Promo/PNL-Befehl. Beispiele:\nPROMO PERCENT 20 ALL\nPROMO BONUS 0.05 SUBSCRIBERS\nPNL CALL_ID 20")
+        bot.answer_callback_query(c.id, "Sende Promo/PnL-Befehl. Beispiele:\nPROMO PERCENT 20 ALL\nPROMO BONUS 0.05 SUBSCRIBERS\nPNL CALL_ID 20")
         return
 
     bot.answer_callback_query(c.id, "")
@@ -1195,7 +1237,7 @@ def catch_all(m: Message):
         sent = 0
         for su in subs:
             try:
-                bot.send_message(su, f"📢 Broadcast: {md_escape(msg)}", parse_mode="Markdown")
+                bot.send_message(su, f"📢 Broadcast: {msg}", parse_mode="Markdown")
                 sent += 1
             except Exception:
                 pass
@@ -1305,7 +1347,7 @@ def catch_all(m: Message):
                     else:
                         rows = []
                     for r in rows:
-                        uid_t = int(r["user_id"])
+                        uid_t = int(row_get(r,"user_id",0))
                         if typ == "PERCENT":
                             bal = get_balance_lamports(uid_t)
                             delta = int(bal * (val / 100.0))
@@ -1326,10 +1368,10 @@ def catch_all(m: Message):
                 with get_db() as con:
                     execs = con.execute("SELECT user_id, stake_lamports FROM executions WHERE call_id=? AND status IN ('FILLED','QUEUED')", (call_id,)).fetchall()
                 for ex in execs:
-                    uid_t = int(ex["user_id"])
-                    stake = int(ex["stake_lamports"] or 0)
+                    uid_t = int(row_get(ex,"user_id",0))
+                    stake = int(row_get(ex,"stake_lamports",0))
                     u = get_user(uid_t)
-                    risk = row_get(u, "auto_risk", "MEDIUM")
+                    risk = row_get(u,"auto_risk","MEDIUM")
                     frac = _risk_fraction(risk)
                     pnl_lam = int(stake * (percent / 100.0) * frac)
                     if pnl_lam != 0:
@@ -1362,36 +1404,32 @@ def auto_executor_loop():
                     LIMIT 200
                 """).fetchall()
             for r in rows:
-                if r["auto_mode"] != "ON":
+                if row_get(r,"auto_mode") != "ON":
                     with get_db() as con:
-                        con.execute("UPDATE executions SET status='ERROR', message='Auto OFF' WHERE id=?", (r["eid"],))
+                        con.execute("UPDATE executions SET status='ERROR', message='Auto OFF' WHERE id=?", (row_get(r,"eid"),))
                     continue
-                call = get_call(r["call_id"])
-                stake_info = r["stake_lamports"] or _compute_stake_for_user(r["user_id"])
+                call = get_call(row_get(r,"call_id"))
+                stake_info = row_get(r,"stake_lamports") or _compute_stake_for_user(row_get(r,"user_id"))
                 if SIMULATION_MODE:
-                    if call["market_type"] == "FUTURES":
-                        result = futures_place_simulated(r["user_id"], call["base"], call["side"], call["leverage"], r["auto_risk"])
+                    if row_get(call,"market_type") == "FUTURES":
+                        result = futures_place_simulated(row_get(r,"user_id"), row_get(call,"base","?"), row_get(call,"side","?"), row_get(call,"leverage",""), row_get(r,"auto_risk","MEDIUM"))
                     else:
-                        result = dex_market_buy_simulated(r["user_id"], call["base"], stake_info)
+                        result = dex_market_buy_simulated(row_get(r,"user_id"), row_get(call,"base","?"), stake_info)
                 else:
                     result = {"status": "FILLED", "txid": "LIVE-TX-REPLACE"}
                 status = result.get("status") or "FILLED"
                 txid = result.get("txid") or result.get("order_id") or ""
                 with get_db() as con:
-                    con.execute("UPDATE executions SET status=?, txid=?, message=? WHERE id=?", (status, txid, "JOINED", r["eid"]))
+                    con.execute("UPDATE executions SET status=?, txid=?, message=? WHERE id=?", (status, txid, "JOINED", row_get(r,"eid")))
                 try:
-                    bot.send_message(
-                        r["user_id"],
-                        "🤖 Auto-Entry • {risk}\n{call_text}\nStatus: *{status}*\nEinsatz (Info): {stake}\nGuthaben: {bal}\n`{txid}`".format(
-                            risk=md_escape(r["auto_risk"]),
-                            call_text=fmt_call(call),
-                            status=md_escape(status),
-                            stake=fmt_sol_usdc(stake_info),
-                            bal=fmt_sol_usdc(get_balance_lamports(r["user_id"])),
-                            txid=md_escape(txid)
-                        ),
-                        parse_mode="Markdown"
-                    )
+                    bot.send_message(row_get(r,"user_id"),
+                                     f"🤖 Auto-Entry • {row_get(r,'auto_risk','MEDIUM')}\n"
+                                     f"{fmt_call(call)}\n"
+                                     f"Status: *{status}*\n"
+                                     f"Einsatz (Info): {fmt_sol_usdc(stake_info)}\n"
+                                     f"Guthaben: {fmt_sol_usdc(get_balance_lamports(row_get(r,'user_id')))}\n"
+                                     f"`{md_escape(txid)}`",
+                                     parse_mode="Markdown")
                 except Exception:
                     pass
         except Exception as e:
@@ -1404,17 +1442,18 @@ def payout_reminder_loop():
             with get_db() as con:
                 rows = con.execute("""
                     SELECT id, amount_lamports FROM payouts
-                    WHERE status='REQUESTED' AND (last_notified_at IS NULL OR (strftime('%s','now') - strftime('%s',COALESCE(last_notified_at,'1970-01-01')) > 1200))
+                    WHERE status='REQUESTED'
+                      AND (last_notified_at IS NULL OR (strftime('%s','now') - strftime('%s',COALESCE(last_notified_at,'1970-01-01')) > 1200))
                     ORDER BY created_at ASC
                 """).fetchall()
             for r in rows:
                 for aid in ADMIN_IDS:
                     try:
-                        bot.send_message(int(aid), f"⏰ Erinnerung: Auszahlung #{r['id']} offen • Betrag {fmt_sol_usdc(r['amount_lamports'])}", reply_markup=kb_payout_manage(r["id"]))
+                        bot.send_message(int(aid), f"⏰ Erinnerung: Auszahlung #{row_get(r,'id')} offen • Betrag {fmt_sol_usdc(row_get(r,'amount_lamports',0))}", reply_markup=kb_payout_manage(row_get(r,"id")))
                     except Exception:
                         pass
                 with get_db() as con:
-                    con.execute("UPDATE payouts SET last_notified_at=CURRENT_TIMESTAMP WHERE id=?", (r["id"],))
+                    con.execute("UPDATE payouts SET last_notified_at=CURRENT_TIMESTAMP WHERE id=?", (row_get(r,"id"),))
             time.sleep(60)
         except Exception as e:
             print("payout reminder loop error:", e)
