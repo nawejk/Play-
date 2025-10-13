@@ -6,6 +6,7 @@ import time
 import random
 import threading
 import sqlite3
+import re
 from contextlib import contextmanager
 from typing import Optional, Dict, List, Tuple
 
@@ -16,10 +17,7 @@ from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton, Message, C
 # ---------------------------
 # Configuration (ENV)
 # ---------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAF1IatYvpNub_6-gKcZnigYMebzcz6Ju3Y").strip()
-if not BOT_TOKEN:
-    # Fallback – setze deinen Token per ENV
-    BOT_TOKEN = "REPLACE_WITH_YOUR_BOT_TOKEN"
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAHjnLKUQs5ZaEhEyKLVft0yqpCeloJQNx0").strip()
 if not BOT_TOKEN or BOT_TOKEN == "REPLACE_WITH_YOUR_BOT_TOKEN":
     raise RuntimeError("BOT_TOKEN environment variable required")
 
@@ -27,10 +25,10 @@ ADMIN_IDS = [a.strip() for a in os.getenv("ADMIN_IDS", "8076025426").split(",") 
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com").strip()
 CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "3wyVwpcbWt96mphJjskFsR2qoyafqJuSfGZYmiipW4oy").strip()
 
-# Liste bekannter Exchange-Absender (optional, CSV in ENV)
+# Bekannte Exchange-Absender (optional, CSV in ENV)
 EXCHANGE_WALLETS = set([s.strip() for s in os.getenv("EXCHANGE_WALLETS", "").split(",") if s.strip()])
 
-# Withdraw fee tiers (lockup_days: fee_percent), default: 5->20%, 7->10%, 10->5%
+# Withdraw fee tiers
 DEFAULT_FEE_TIERS = {5: 20.0, 7: 10.0, 10: 5.0}
 _fee_tiers: Dict[int, float] = {}
 raw_tiers = os.getenv("WITHDRAW_FEE_TIERS", "")
@@ -48,11 +46,11 @@ DB_PATH = os.getenv("DB_PATH", "memebot_full.db")
 LAMPORTS_PER_SOL = 1_000_000_000
 MIN_SUB_SOL = float(os.getenv("MIN_SUB_SOL", "0.1"))
 
-# Simulation flag – echte Trading-Integrationen später hinzufügen
+# Simulation flag
 SIMULATION_MODE = True
 
 # ---------------------------
-# Utilities: price + formatting
+# Utilities
 # ---------------------------
 _price_cache = {"t": 0.0, "usd": 0.0}
 
@@ -82,6 +80,46 @@ def fmt_sol_usdc(lamports_or_int: int) -> str:
 def parse_fee_tiers() -> List[Tuple[int, float]]:
     return sorted([(int(d), float(p)) for d, p in _fee_tiers.items()], key=lambda x: x[0])
 
+def md_escape(text: str) -> str:
+    if not isinstance(text, str):
+        return ""
+    return (text.replace('\\', '\\\\')
+                .replace('_', '\\_')
+                .replace('*', '\\*')
+                .replace('`', '\\`')
+                .replace('[', '\\['))
+
+def row_get(row, key, default=None):
+    if row is None:
+        return default
+    try:
+        return row[key] if key in row.keys() else default
+    except Exception:
+        try:
+            return row.get(key, default)
+        except Exception:
+            return default
+
+def is_admin(user_id: int) -> bool:
+    return str(user_id) in ADMIN_IDS
+
+def is_probably_solana_address(addr: str) -> bool:
+    if not isinstance(addr, str):
+        return False
+    addr = addr.strip()
+    if len(addr) < 32 or len(addr) > 44:
+        return False
+    allowed = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+    return all(ch in allowed for ch in addr)
+
+def gen_referral_for_user(user_id: int) -> str:
+    import hashlib
+    h = hashlib.sha1(str(user_id).encode()).hexdigest()[:8]
+    return f"REF{h.upper()}"
+
+def is_float_str(s: str) -> bool:
+    return bool(re.fullmatch(r"[+-]?([0-9]+(\.[0-9]+)?|\.[0-9]+)", s.strip()))
+
 # ---------------------------
 # DB schema & helpers
 # ---------------------------
@@ -97,6 +135,7 @@ CREATE TABLE IF NOT EXISTS users (
   auto_risk TEXT DEFAULT 'MEDIUM',
   sol_balance_lamports INTEGER DEFAULT 0,
   source_wallet TEXT,
+  payout_wallet TEXT,
   sub_types TEXT DEFAULT '',
   referral_code TEXT DEFAULT ''
 );
@@ -168,52 +207,13 @@ def init_db():
             "ALTER TABLE executions ADD COLUMN stake_lamports INTEGER DEFAULT 0",
             "ALTER TABLE payouts ADD COLUMN lockup_days INTEGER DEFAULT 0",
             "ALTER TABLE payouts ADD COLUMN fee_percent REAL DEFAULT 0.0",
-            "ALTER TABLE users ADD COLUMN referral_code TEXT DEFAULT ''"
+            "ALTER TABLE users ADD COLUMN referral_code TEXT DEFAULT ''",
+            "ALTER TABLE users ADD COLUMN payout_wallet TEXT"  # neu
         ]:
-            try: con.execute(stmt)
-            except Exception: pass
-
-# ---------------------------
-# Misc helpers
-# ---------------------------
-def md_escape(text: str) -> str:
-    if not isinstance(text, str):
-        return ""
-    return (text.replace('\\', '\\\\')
-                .replace('_', '\\_')
-                .replace('*', '\\*')
-                .replace('`', '\\`')
-                .replace('[', '\\['))
-
-def row_get(row, key, default=None):
-    """Safe access for sqlite3.Row and dict."""
-    if row is None:
-        return default
-    try:
-        # sqlite3.Row
-        return row[key] if key in row.keys() else default
-    except Exception:
-        try:
-            return row.get(key, default)  # dict
-        except Exception:
-            return default
-
-def is_admin(user_id: int) -> bool:
-    return str(user_id) in ADMIN_IDS
-
-def is_probably_solana_address(addr: str) -> bool:
-    if not isinstance(addr, str):
-        return False
-    addr = addr.strip()
-    if len(addr) < 32 or len(addr) > 44:
-        return False
-    allowed = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
-    return all(ch in allowed for ch in addr)
-
-def gen_referral_for_user(user_id: int) -> str:
-    import hashlib
-    h = hashlib.sha1(str(user_id).encode()).hexdigest()[:8]
-    return f"REF{h.upper()}"
+            try:
+                con.execute(stmt)
+            except Exception:
+                pass
 
 # ---------------------------
 # CRUD & business logic
@@ -260,6 +260,10 @@ def set_source_wallet(user_id: int, wallet: str):
     with get_db() as con:
         con.execute("UPDATE users SET source_wallet=? WHERE user_id=?", (wallet, user_id))
 
+def set_payout_wallet(user_id: int, wallet: str):
+    with get_db() as con:
+        con.execute("UPDATE users SET payout_wallet=? WHERE user_id=?", (wallet, user_id))
+
 def set_referral(user_id: int, code: str):
     with get_db() as con:
         con.execute("UPDATE users SET referral_code=? WHERE user_id=?", (code, user_id))
@@ -272,15 +276,6 @@ def set_balance(user_id: int, lamports: int):
     with get_db() as con:
         con.execute("UPDATE users SET sol_balance_lamports = ? WHERE user_id=?", (lamports, user_id))
 
-def subtract_balance(user_id: int, lamports: int) -> bool:
-    with get_db() as con:
-        row = con.execute("SELECT sol_balance_lamports FROM users WHERE user_id=?", (user_id,)).fetchone()
-        bal = row_get(row, "sol_balance_lamports", 0)
-        if bal < lamports:
-            return False
-        con.execute("UPDATE users SET sol_balance_lamports = sol_balance_lamports - ? WHERE user_id=?", (lamports, user_id))
-        return True
-
 def get_balance_lamports(user_id: int) -> int:
     with get_db() as con:
         row = con.execute("SELECT sol_balance_lamports FROM users WHERE user_id=?", (user_id,)).fetchone()
@@ -289,7 +284,7 @@ def get_balance_lamports(user_id: int) -> int:
 def list_investors(limit: int = 50, offset: int = 0):
     with get_db() as con:
         return con.execute("""
-            SELECT user_id, username, sol_balance_lamports, source_wallet, sub_active, sub_types
+            SELECT user_id, username, sol_balance_lamports, source_wallet, payout_wallet, sub_active, sub_types
             FROM users
             WHERE sub_active=1
             ORDER BY sol_balance_lamports DESC
@@ -357,12 +352,20 @@ def kb_main(u):
     kb.add(InlineKeyboardButton("🔔 Signale", callback_data="sub_menu"),
            InlineKeyboardButton("📰 News", callback_data="news_sub_menu"))
     kb.add(InlineKeyboardButton("⚙️ Auto-Entry", callback_data="auto_menu"),
-           InlineKeyboardButton("❓ Hilfe", callback_data="help"))
+           InlineKeyboardButton("🏷️ Wallets", callback_data="wallets_menu"))
     kb.add(InlineKeyboardButton("🔗 Referral", callback_data="referral"),
-           InlineKeyboardButton("📈 Mein Portfolio", callback_data="my_portfolio"))
+           InlineKeyboardButton("📈 Portfolio", callback_data="my_portfolio"))
+    kb.add(InlineKeyboardButton("❓ Hilfe", callback_data="help"))
     if is_admin(row_get(u, "user_id", 0)):
         kb.add(InlineKeyboardButton("🛠️ Admin (Kontrolle)", callback_data="admin_menu_big"))
     kb.add(InlineKeyboardButton(f"🏦 Guthaben: {bal}", callback_data="noop"))
+    return kb
+
+def kb_wallets():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("↪️ Einzahlungs-Wallet setzen", callback_data="set_deposit_wallet"))
+    kb.add(InlineKeyboardButton("↩️ Auszahlungs-Wallet setzen", callback_data="set_payout_wallet"))
+    kb.add(InlineKeyboardButton("⬅️ Zurück", callback_data="back_home"))
     return kb
 
 def kb_sub_menu():
@@ -397,8 +400,8 @@ def kb_admin_main(page: int = 0):
     kb.add(InlineKeyboardButton("📣 Broadcast Call", callback_data="admin_broadcast_last"))
     kb.add(InlineKeyboardButton("👥 Investoren", callback_data="admin_list_investors"))
     kb.add(InlineKeyboardButton("👀 Nutzer verwalten", callback_data=f"admin_view_users_{page}"))
-    kb.add(InlineKeyboardButton("💬 News senden", callback_data="admin_news_send"))
     kb.add(InlineKeyboardButton("💼 Guthaben ändern", callback_data="admin_balance_edit"))
+    kb.add(InlineKeyboardButton("💬 News senden", callback_data="admin_news_send"))
     kb.add(InlineKeyboardButton("📤 Broadcast an alle", callback_data="admin_broadcast_all"))
     kb.add(InlineKeyboardButton("🔧 Promotions / PnL", callback_data="admin_apply_pnl"))
     kb.add(InlineKeyboardButton("⬅️ Zurück", callback_data="back_home"))
@@ -418,9 +421,9 @@ def kb_users_pagination(offset: int, total: int, prefix: str = "admin_view_users
 def kb_user_row(user_id: int):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("💰 Guthaben ändern", callback_data=f"admin_balance_{user_id}"),
-           InlineKeyboardButton("🏷️ Wallet setzen", callback_data=f"admin_setwallet_{user_id}"))
-    kb.add(InlineKeyboardButton("📤 Nachricht", callback_data=f"admin_msg_{user_id}"),
-           InlineKeyboardButton("🧾 Payouts", callback_data=f"admin_payouts_{user_id}"))
+           InlineKeyboardButton("↪️ Einzahlungs-Wallet", callback_data=f"admin_setwallet_{user_id}"))
+    kb.add(InlineKeyboardButton("↩️ Auszahlungs-Wallet", callback_data=f"admin_setpayout_{user_id}"),
+           InlineKeyboardButton("📤 Nachricht", callback_data=f"admin_msg_{user_id}"))
     return kb
 
 def kb_withdraw_options():
@@ -438,7 +441,7 @@ def kb_payout_manage(pid: int):
     return kb
 
 # ---------------------------
-# RPC watcher (backoff)
+# RPC watcher
 # ---------------------------
 checked_signatures = set()
 
@@ -593,7 +596,7 @@ class CentralWatcher:
                 self.on_verified_deposit({"user_id": uid, "amount_lamports": amount, "sig": sig})
 
 # ---------------------------
-# Simulated trading (replace when integrating real APIs)
+# Simulated trading
 # ---------------------------
 def dex_market_buy_simulated(user_id: int, base: str, amount_lamports: int):
     return {"status": "FILLED", "txid": f"Live-DEX-{base}-{int(time.time())}", "spent_lamports": amount_lamports}
@@ -607,7 +610,6 @@ def futures_place_simulated(user_id: int, base: str, side: str, leverage: str, r
 init_db()
 bot = telebot.TeleBot(BOT_TOKEN, parse_mode="Markdown")
 
-# Safe sender: versuche unescaped; bei Fehler → escapen; letzter Versuch ohne parse_mode
 _original_send_message = bot.send_message
 def _safe_send_message(chat_id, text, **kwargs):
     try:
@@ -615,17 +617,14 @@ def _safe_send_message(chat_id, text, **kwargs):
     except Exception:
         pm = kwargs.get("parse_mode")
         if pm and str(pm).upper().startswith("MARKDOWN"):
-            kwargs2 = dict(kwargs)
-            kwargs2["parse_mode"] = "Markdown"
+            kwargs2 = dict(kwargs); kwargs2["parse_mode"] = "Markdown"
             try:
                 return _original_send_message(chat_id, md_escape(str(text)), **kwargs2)
             except Exception:
-                kwargs3 = dict(kwargs2)
-                kwargs3.pop("parse_mode", None)
+                kwargs3 = dict(kwargs2); kwargs3.pop("parse_mode", None)
                 return _original_send_message(chat_id, str(text), **kwargs3)
         else:
-            kwargs3 = dict(kwargs)
-            kwargs3.pop("parse_mode", None)
+            kwargs3 = dict(kwargs); kwargs3.pop("parse_mode", None)
             return _original_send_message(chat_id, str(text), **kwargs3)
 
 bot.send_message = _safe_send_message
@@ -637,31 +636,33 @@ def _safe_edit_message_text(text, chat_id, message_id, **kwargs):
     except Exception:
         pm = kwargs.get("parse_mode")
         if pm and str(pm).upper().startswith("MARKDOWN"):
-            kwargs2 = dict(kwargs)
-            kwargs2["parse_mode"] = "Markdown"
+            kwargs2 = dict(kwargs); kwargs2["parse_mode"] = "Markdown"
             try:
                 return _original_edit_message_text(md_escape(str(text)), chat_id, message_id, **kwargs2)
             except Exception:
-                kwargs3 = dict(kwargs2)
-                kwargs3.pop("parse_mode", None)
+                kwargs3 = dict(kwargs2); kwargs3.pop("parse_mode", None)
                 return _original_edit_message_text(str(text), chat_id, message_id, **kwargs3)
         else:
-            kwargs3 = dict(kwargs)
-            kwargs3.pop("parse_mode", None)
+            kwargs3 = dict(kwargs); kwargs3.pop("parse_mode", None)
             return _original_edit_message_text(str(text), chat_id, message_id, **kwargs3)
 
 bot.edit_message_text = _safe_edit_message_text
 
-# transient state
+# ---------------------------
+# Transient state
+# ---------------------------
 WAITING_SOURCE_WALLET: Dict[int, bool] = {}
-WAITING_WITHDRAW_AMOUNT: Dict[int, Optional[int]] = {}
+WAITING_PAYOUT_WALLET: Dict[int, bool] = {}
+WAITING_WITHDRAW_AMOUNT: Dict[int, Optional[int]] = {}  # None = erwartet Zahl
 ADMIN_AWAIT_SIMPLE_CALL: Dict[int, bool] = {}
-ADMIN_AWAIT_BALANCE_EDIT: Dict[int, Optional[int]] = {}
+ADMIN_AWAIT_BALANCE_EDIT: Dict[int, Optional[object]] = {}  # int user_id | "BULK"
 ADMIN_AWAIT_SET_WALLET: Dict[int, Optional[int]] = {}
+ADMIN_AWAIT_SET_PAYOUT: Dict[int, Optional[int]] = {}
 ADMIN_AWAIT_TRADE_STATUS: Dict[int, bool] = {}
 ADMIN_AWAIT_PNL: Dict[int, bool] = {}
 ADMIN_AWAIT_NEWS_BROADCAST: Dict[int, Dict] = {}
 ADMIN_AWAIT_IMPORT_BALANCES: Dict[int, bool] = {}
+SUPPORT_AWAIT_TEXT: Dict[int, bool] = {}  # /support
 
 watcher = CentralWatcher(CENTRAL_SOL_PUBKEY)
 
@@ -699,7 +700,7 @@ def ensure_db_backup():
 ensure_db_backup()
 
 # ---------------------------
-# Home text (Wunschformat)
+# Home text & helpers
 # ---------------------------
 def get_bot_username():
     try:
@@ -729,7 +730,7 @@ def home_text(u) -> str:
     )
 
 # ---------------------------
-# Handlers
+# Commands
 # ---------------------------
 @bot.message_handler(commands=["start"])
 def cmd_start(m: Message):
@@ -738,7 +739,7 @@ def cmd_start(m: Message):
     admin_flag = 1 if is_admin(uid) else 0
     upsert_user(uid, uname, admin_flag)
 
-    # Referral payload (/start CODE oder /start=CODE)
+    # Referral payload
     ref_code = None
     txt = (m.text or "")
     parts = txt.split()
@@ -752,17 +753,13 @@ def cmd_start(m: Message):
             ref_row = con.execute("SELECT user_id FROM users WHERE referral_code=?", (ref_code,)).fetchone()
         referrer = row_get(ref_row, "user_id")
         if referrer and referrer != uid:
-            bonus_lam = int(0.01 * LAMPORTS_PER_SOL)  # 0.01 SOL Bonus
+            bonus_lam = int(0.01 * LAMPORTS_PER_SOL)
             add_balance(referrer, bonus_lam)
             add_balance(uid, bonus_lam)
-            try:
-                bot.send_message(referrer, f"🎉 Dein Referral {md_escape(ref_code)} wurde verwendet! Bonus: {fmt_sol_usdc(bonus_lam)}")
-            except Exception:
-                pass
-            try:
-                bot.send_message(uid, f"🎉 Willkommen! Du und der Referrer bekommen je {fmt_sol_usdc(bonus_lam)} Bonus.")
-            except Exception:
-                pass
+            try: bot.send_message(referrer, f"🎉 Dein Referral {md_escape(ref_code)} wurde verwendet! Bonus: {fmt_sol_usdc(bonus_lam)}")
+            except Exception: pass
+            try: bot.send_message(uid, f"🎉 Willkommen! Du und der Referrer bekommen je {fmt_sol_usdc(bonus_lam)} Bonus.")
+            except Exception: pass
 
     # ensure referral code exists
     u = get_user(uid)
@@ -772,6 +769,27 @@ def cmd_start(m: Message):
 
     bot.reply_to(m, home_text(u), reply_markup=kb_main(u))
 
+@bot.message_handler(commands=["support"])
+def cmd_support(m: Message):
+    uid = m.from_user.id
+    SUPPORT_AWAIT_TEXT[uid] = True
+    bot.reply_to(m, "📩 Bitte beschreibe dein Anliegen. Ich leite es an einen Admin weiter.", parse_mode=None)
+
+@bot.message_handler(commands=["set_deposit"])
+def cmd_set_deposit(m: Message):
+    uid = m.from_user.id
+    WAITING_SOURCE_WALLET[uid] = True
+    bot.reply_to(m, "✍️ Sende jetzt deine **Einzahlungs**-Absender-Wallet (SOL-Adresse):", parse_mode="Markdown")
+
+@bot.message_handler(commands=["set_payout"])
+def cmd_set_payout(m: Message):
+    uid = m.from_user.id
+    WAITING_PAYOUT_WALLET[uid] = True
+    bot.reply_to(m, "✍️ Sende jetzt deine **Auszahlungs**-Wallet (SOL-Adresse):", parse_mode="Markdown")
+
+# ---------------------------
+# Callbacks
+# ---------------------------
 @bot.callback_query_handler(func=lambda c: True)
 def on_cb(c: CallbackQuery):
     uid = c.from_user.id
@@ -789,12 +807,30 @@ def on_cb(c: CallbackQuery):
     if data == "help":
         bot.answer_callback_query(c.id)
         bot.send_message(uid,
-                         ("ℹ️ Hilfe:\n\n"
-                          "1) Einzahlen: Absender-Wallet angeben → Sende SOL an zentrale Adresse.\n"
-                          "2) Abonnieren: Abo aktivieren/deaktivieren.\n"
-                          "3) Auto-Entry: ON/OFF und Risiko einstellen.\n"
-                          "4) Auszahlungen: Lockup & Gebühren auswählbar."),
-                         parse_mode="Markdown")
+            ("ℹ️ Hilfe:\n\n"
+             "1) Einzahlen: Einzahlungs-Wallet (Absender) angeben → Sende SOL an zentrale Adresse.\n"
+             "2) Abonnieren: Abo aktivieren/deaktivieren.\n"
+             "3) Auto-Entry: ON/OFF und Risiko einstellen.\n"
+             "4) Auszahlungen: Lockup & Gebühren auswählbar.\n"
+             "5) Wallets: Einzahlungs- & Auszahlungs-Wallet setzen."),
+            parse_mode="Markdown")
+        return
+
+    # Wallets menu
+    if data == "wallets_menu":
+        bot.edit_message_text("🏷️ Wallet-Verwaltung:", c.message.chat.id, c.message.message_id, reply_markup=kb_wallets())
+        return
+
+    if data == "set_deposit_wallet":
+        WAITING_SOURCE_WALLET[uid] = True
+        bot.answer_callback_query(c.id, "Einzahlungs-Wallet setzen")
+        bot.send_message(uid, "Sende jetzt deine **Einzahlungs**-Absender-Wallet (SOL-Adresse):", parse_mode="Markdown")
+        return
+
+    if data == "set_payout_wallet":
+        WAITING_PAYOUT_WALLET[uid] = True
+        bot.answer_callback_query(c.id, "Auszahlungs-Wallet setzen")
+        bot.send_message(uid, "Sende jetzt deine **Auszahlungs**-Wallet (SOL-Adresse):", parse_mode="Markdown")
         return
 
     # deposit
@@ -968,7 +1004,7 @@ def on_cb(c: CallbackQuery):
         with get_db() as con:
             total = con.execute("SELECT COUNT(*) as cnt FROM users").fetchone()["cnt"]
             rows = con.execute("""
-                SELECT user_id, username, sol_balance_lamports, source_wallet, auto_mode, auto_risk, sub_types
+                SELECT user_id, username, sol_balance_lamports, source_wallet, payout_wallet, auto_mode, auto_risk, sub_types
                 FROM users
                 ORDER BY sol_balance_lamports DESC
                 LIMIT 10 OFFSET ?
@@ -981,7 +1017,8 @@ def on_cb(c: CallbackQuery):
             uname = "@" + row_get(r,"username","") if row_get(r,"username") else "(kein Username)"
             txt = (f"{uname} • UID {row_get(r,'user_id')}\n"
                    f"Guthaben: {fmt_sol_usdc(row_get(r,'sol_balance_lamports',0))}\n"
-                   f"Source: `{md_escape(row_get(r,'source_wallet','-'))}`\n"
+                   f"Einzahlung: `{md_escape(row_get(r,'source_wallet','-'))}`\n"
+                   f"Auszahlung: `{md_escape(row_get(r,'payout_wallet','-'))}`\n"
                    f"Auto: {row_get(r,'auto_mode','OFF')} / {row_get(r,'auto_risk','MEDIUM')}\n"
                    f"News: {row_get(r,'sub_types','-')}")
             bot.send_message(uid, txt, parse_mode="Markdown", reply_markup=kb_user_row(row_get(r,"user_id")))
@@ -989,6 +1026,13 @@ def on_cb(c: CallbackQuery):
         return
 
     # admin inline actions
+    if data == "admin_balance_edit":
+        if not is_admin(uid): return
+        ADMIN_AWAIT_BALANCE_EDIT[uid] = "BULK"
+        bot.answer_callback_query(c.id, "Guthaben ändern (BULK)")
+        bot.send_message(uid, "Sende jetzt **UID Betrag** in SOL.\nBeispiele:\n`7258364875 -0.3`\n`7258364875 +0.5`\n`7258364875 1.25` (setzt absolut auf 1.25 SOL)", parse_mode="Markdown")
+        return
+
     if data.startswith("admin_balance_"):
         if not is_admin(uid): return
         try:
@@ -997,7 +1041,8 @@ def on_cb(c: CallbackQuery):
             bot.answer_callback_query(c.id, "Ungültig")
             return
         ADMIN_AWAIT_BALANCE_EDIT[uid] = target
-        bot.answer_callback_query(c.id, f"Guthabenänderung: UID {target} — sende Betrag in SOL (z.B. 0.2 oder -0.05)")
+        bot.answer_callback_query(c.id, f"Guthabenänderung: UID {target}")
+        bot.send_message(uid, "Sende Betrag in SOL:\n`-0.2` (abziehen) • `+0.2` (gutschreiben) • `0.8` (absolut setzen)", parse_mode="Markdown")
         return
 
     if data.startswith("admin_setwallet_"):
@@ -1008,7 +1053,20 @@ def on_cb(c: CallbackQuery):
             bot.answer_callback_query(c.id, "Ungültig")
             return
         ADMIN_AWAIT_SET_WALLET[uid] = target
-        bot.answer_callback_query(c.id, f"Sende Source-Wallet für UID {target}")
+        bot.answer_callback_query(c.id, f"Sende Einzahlungs-Wallet für UID {target}")
+        bot.send_message(uid, f"Sende **Einzahlungs**-Wallet (SOL) für UID {target}:", parse_mode="Markdown")
+        return
+
+    if data.startswith("admin_setpayout_"):
+        if not is_admin(uid): return
+        try:
+            target = int(data.split("_", 2)[2])
+        except Exception:
+            bot.answer_callback_query(c.id, "Ungültig")
+            return
+        ADMIN_AWAIT_SET_PAYOUT[uid] = target
+        bot.answer_callback_query(c.id, f"Sende Auszahlungs-Wallet für UID {target}")
+        bot.send_message(uid, f"Sende **Auszahlungs**-Wallet (SOL) für UID {target}:", parse_mode="Markdown")
         return
 
     if data.startswith("admin_msg_"):
@@ -1019,24 +1077,7 @@ def on_cb(c: CallbackQuery):
             bot.answer_callback_query(c.id, "Ungültig")
             return
         ADMIN_AWAIT_NEWS_BROADCAST[uid] = {"step": "awaiting_support_msg", "target": target}
-        bot.answer_callback_query(c.id, "Sende die Support-Nachricht, optional danach Bild (oder 'nopict').")
-        return
-
-    if data.startswith("admin_payouts_"):
-        if not is_admin(uid): return
-        try:
-            target = int(data.split("_", 2)[2])
-        except Exception:
-            bot.answer_callback_query(c.id, "Ungültig")
-            return
-        with get_db() as con:
-            rows = con.execute("SELECT * FROM payouts WHERE user_id=? ORDER BY created_at DESC LIMIT 10", (target,)).fetchall()
-        if not rows:
-            bot.answer_callback_query(c.id, "Keine Auszahlungen")
-            return
-        bot.answer_callback_query(c.id)
-        for r in rows:
-            bot.send_message(uid, f"#{row_get(r,'id')} • {fmt_sol_usdc(row_get(r,'amount_lamports',0))} • {row_get(r,'status','-')} • Lockup {row_get(r,'lockup_days',0)}d • Fee {row_get(r,'fee_percent',0)}%", parse_mode=None)
+        bot.answer_callback_query(c.id, "Sende die Nachricht, optional danach Bild (oder 'nopict').")
         return
 
     if data == "admin_broadcast_all":
@@ -1046,10 +1087,17 @@ def on_cb(c: CallbackQuery):
         ADMIN_AWAIT_TRADE_STATUS[uid] = True
         return
 
+    # payouts (queue/approve/etc.) & payoutopt remain as in your logic
     if data == "admin_payout_queue":
         if not is_admin(uid): return
         with get_db() as con:
-            rows = con.execute("SELECT p.*, u.username FROM payouts p JOIN users u ON u.user_id=p.user_id WHERE p.status='REQUESTED' ORDER BY p.created_at ASC LIMIT 50").fetchall()
+            rows = con.execute("""
+                SELECT p.*, u.username
+                FROM payouts p
+                JOIN users u ON u.user_id=p.user_id
+                WHERE p.status='REQUESTED'
+                ORDER BY p.created_at ASC LIMIT 50
+            """).fetchall()
         if not rows:
             bot.answer_callback_query(c.id, "Keine offenen Auszahlungen.")
             return
@@ -1085,24 +1133,21 @@ def on_cb(c: CallbackQuery):
             bot.answer_callback_query(c.id, "Genehmigt.")
             try:
                 bot.send_message(row_get(row,"user_id"), "✅ Deine Auszahlung wurde genehmigt. Admin wird die Zahlung durchführen.")
-            except Exception:
-                pass
+            except Exception: pass
         elif action == "SENT":
             with get_db() as con:
                 con.execute("UPDATE payouts SET status='SENT' WHERE id=?", (pid,))
             bot.answer_callback_query(c.id, "Als gesendet markiert.")
             try:
                 bot.send_message(row_get(row,"user_id"), "📤 Deine Auszahlung wurde als gesendet markiert.")
-            except Exception:
-                pass
+            except Exception: pass
         elif action == "REJECT":
             with get_db() as con:
                 con.execute("UPDATE payouts SET status='REJECTED' WHERE id=?", (pid,))
             bot.answer_callback_query(c.id, "Abgelehnt.")
             try:
                 bot.send_message(row_get(row,"user_id"), "❌ Deine Auszahlung wurde abgelehnt.")
-            except Exception:
-                pass
+            except Exception: pass
         return
 
     if data.startswith("payoutopt_"):
@@ -1111,15 +1156,17 @@ def on_cb(c: CallbackQuery):
         except Exception:
             bot.answer_callback_query(c.id, "Ungültig")
             return
-        fee = float(_fee_tiers.get(days, DEFAULT_FEE_Tiers.get(days, 0.0))) if False else float(_fee_tiers.get(days, 0.0))
+        fee = float(_fee_tiers.get(days, DEFAULT_FEE_TIERS.get(days, 0.0)))
         pending = WAITING_WITHDRAW_AMOUNT.get(uid)
         if not pending or pending <= 0:
             bot.answer_callback_query(c.id, "Keine ausstehende Auszahlung.")
             return
         lam = int(pending)
         with get_db() as con:
-            cur = con.execute("INSERT INTO payouts(user_id, amount_lamports, status, note, lockup_days, fee_percent) VALUES (?,?,?,?,?,?)",
-                              (uid, lam, "REQUESTED", f"User requested withdrawal ({days}d)", days, fee))
+            cur = con.execute("""
+                INSERT INTO payouts(user_id, amount_lamports, status, note, lockup_days, fee_percent)
+                VALUES (?,?,?,?,?,?)
+            """, (uid, lam, "REQUESTED", f"User requested withdrawal ({days}d)", days, fee))
             pid = cur.lastrowid
         WAITING_WITHDRAW_AMOUNT.pop(uid, None)
         bot.answer_callback_query(c.id, "Auszahlung angefragt.")
@@ -1137,35 +1184,62 @@ def on_cb(c: CallbackQuery):
             bot.answer_callback_query(c.id, "Nicht erlaubt.")
             return
         ADMIN_AWAIT_PNL[uid] = True
-        bot.answer_callback_query(c.id, "Sende Promo/PnL-Befehl. Beispiele:\nPROMO PERCENT 20 ALL\nPROMO BONUS 0.05 SUBSCRIBERS\nPNL CALL_ID 20")
+        bot.answer_callback_query(c.id, "Sende Promo/PnL-Befehl. Beispiele:\nPROMO PERCENT 20 ALL\nPROMO BONUS 0.05 SUBSCRIBERS\nPNL 123 -20")
         return
 
     bot.answer_callback_query(c.id, "")
 
+# ---------------------------
+# Messages (catch-all)
+# ---------------------------
 @bot.message_handler(func=lambda m: True)
 def catch_all(m: Message):
     uid = m.from_user.id
     text = (m.text or "").strip() if m.text else ""
 
-    # Admin: set wallet
+    # /support flow
+    if SUPPORT_AWAIT_TEXT.get(uid):
+        SUPPORT_AWAIT_TEXT.pop(uid, None)
+        msg = text if text else "(ohne Text)"
+        u = get_user(uid)
+        uname = "@" + row_get(u, "username","") if row_get(u,"username") else f"UID {uid}"
+        bot.reply_to(m, "✅ Danke! Deine Nachricht wurde an einen Admin weitergeleitet.")
+        for aid in ADMIN_IDS:
+            try:
+                bot.send_message(int(aid), f"📩 Support von {uname} (UID {uid}):\n{md_escape(msg)}", parse_mode="Markdown")
+            except Exception:
+                pass
+        return
+
+    # Admin: set deposit wallet
     if ADMIN_AWAIT_SET_WALLET.get(uid):
         target = ADMIN_AWAIT_SET_WALLET.pop(uid)
         if not is_admin(uid):
-            bot.reply_to(m, "Nicht erlaubt.")
-            return
+            bot.reply_to(m, "Nicht erlaubt."); return
         wallet = text
         if not is_probably_solana_address(wallet):
-            bot.reply_to(m, "Ungültige Solana-Adresse.")
-            return
+            bot.reply_to(m, "Ungültige Solana-Adresse."); return
         set_source_wallet(target, wallet)
-        bot.reply_to(m, f"Source-Wallet für {target} gesetzt: `{md_escape(wallet)}`", parse_mode="Markdown")
-        try:
-            bot.send_message(target, f"Admin hat deine Source-Wallet gesetzt: `{md_escape(wallet)}`", parse_mode="Markdown")
-        except Exception:
-            pass
+        bot.reply_to(m, f"✅ Einzahlungs-Wallet gesetzt für {target}: `{md_escape(wallet)}`", parse_mode="Markdown")
+        try: bot.send_message(target, f"Admin hat deine **Einzahlungs**-Wallet gesetzt: `{md_escape(wallet)}`", parse_mode="Markdown")
+        except Exception: pass
         return
 
-    # Initial source wallet setting by user
+    # Admin: set payout wallet
+    if ADMIN_AWAIT_SET_PAYOUT.get(uid):
+        target = ADMIN_AWAIT_SET_PAYOUT.pop(uid)
+        if not is_admin(uid):
+            bot.reply_to(m, "Nicht erlaubt."); return
+        wallet = text
+        if not is_probably_solana_address(wallet):
+            bot.reply_to(m, "Ungültige Solana-Adresse."); return
+        set_payout_wallet(target, wallet)
+        bot.reply_to(m, f"✅ Auszahlungs-Wallet gesetzt für {target}: `{md_escape(wallet)}`", parse_mode="Markdown")
+        try: bot.send_message(target, f"Admin hat deine **Auszahlungs**-Wallet gesetzt: `{md_escape(wallet)}`", parse_mode="Markdown")
+        except Exception: pass
+        return
+
+    # User set deposit wallet
     if WAITING_SOURCE_WALLET.get(uid, False):
         WAITING_SOURCE_WALLET[uid] = False
         wallet = text
@@ -1178,16 +1252,25 @@ def catch_all(m: Message):
         bot.reply_to(m, f"✅ Absender-Wallet gespeichert.\nSende SOL von `{md_escape(wallet)}` an `{md_escape(CENTRAL_SOL_PUBKEY)}`\n{px}", parse_mode="Markdown")
         return
 
+    # User set payout wallet
+    if WAITING_PAYOUT_WALLET.get(uid, False):
+        WAITING_PAYOUT_WALLET[uid] = False
+        wallet = text
+        if not is_probably_solana_address(wallet):
+            bot.reply_to(m, "Bitte eine gültige Solana-Adresse eingeben.", parse_mode="Markdown")
+            return
+        set_payout_wallet(uid, wallet)
+        bot.reply_to(m, f"✅ Auszahlungs-Wallet gespeichert: `{md_escape(wallet)}`", parse_mode="Markdown")
+        return
+
     # Admin: create simple call
     if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
         ADMIN_AWAIT_SIMPLE_CALL[uid] = False
         if not is_admin(uid):
-            bot.reply_to(m, "Nicht erlaubt.")
-            return
+            bot.reply_to(m, "Nicht erlaubt."); return
         parts = [p.strip() for p in text.split("|")]
         if len(parts) < 2:
-            bot.reply_to(m, "Formatfehler.")
-            return
+            bot.reply_to(m, "Formatfehler."); return
         t0 = parts[0].upper()
         if t0 == "FUTURES" and len(parts) >= 4:
             _, base, side, lev = parts[:4]
@@ -1203,36 +1286,55 @@ def catch_all(m: Message):
             bot.reply_to(m, "Formatfehler.")
         return
 
-    # Admin: set balance (inline flow)
+    # Admin: balance edit (per-user or bulk)
     if ADMIN_AWAIT_BALANCE_EDIT.get(uid) is not None:
         target = ADMIN_AWAIT_BALANCE_EDIT.pop(uid)
         if not is_admin(uid):
-            bot.reply_to(m, "Nicht erlaubt.")
-            return
-        try:
-            sol = float(text.replace(",", "."))
-            lam = int(sol * LAMPORTS_PER_SOL)
-            set_balance(target, lam)
-            nb = fmt_sol_usdc(get_balance_lamports(target))
-            bot.reply_to(m, f"✅ Guthaben gesetzt: {target} {fmt_sol_usdc(lam)} • Neues Guthaben: {nb}")
-            try:
-                bot.send_message(target, f"Admin hat dein Guthaben gesetzt: {fmt_sol_usdc(lam)} • Neues Guthaben: {nb}", parse_mode="Markdown")
-            except Exception:
-                pass
-        except Exception:
-            bot.reply_to(m, "Fehler beim Parsen. Sende z.B. 0.25")
+            bot.reply_to(m, "Nicht erlaubt."); return
+
+        # Bulk: "UID Betrag"
+        if target == "BULK":
+            m_uid = re.search(r"([0-9]{6,})", text)
+            m_amt = re.search(r"([+-]?([0-9]+(\.[0-9]+)?|\.[0-9]+))", text)
+            if not m_uid or not m_amt:
+                bot.reply_to(m, "Format: UID Betrag (z.B. `7258364875 -0.3`)", parse_mode="Markdown")
+                return
+            target_uid = int(m_uid.group(1))
+            sol_val = float(m_amt.group(1))
+        else:
+            # Per-user: nur Betrag
+            if not is_float_str(text):
+                bot.reply_to(m, "Bitte Betrag in SOL senden (z. B. `-0.2`, `+0.5`, `0.8`).", parse_mode="Markdown")
+                return
+            target_uid = int(target)
+            sol_val = float(text.replace(",", "."))
+
+        lam_val = int(abs(sol_val) * LAMPORTS_PER_SOL)
+        if sol_val > 0 and not text.strip().startswith(("+", "-")) and target != "BULK":
+            # Absolutes Setzen, wenn kein +/-
+            set_balance(target_uid, int(sol_val * LAMPORTS_PER_SOL))
+            nb = fmt_sol_usdc(get_balance_lamports(target_uid))
+            bot.reply_to(m, f"✅ Guthaben **gesetzt** für {target_uid}. Neues Guthaben: {nb}")
+        else:
+            # Delta anwenden (+/-)
+            if sol_val >= 0:
+                add_balance(target_uid, lam_val)
+                op = "gutgeschrieben"
+            else:
+                add_balance(target_uid, -lam_val)  # negativ abziehen
+                op = "abgezogen"
+            nb = fmt_sol_usdc(get_balance_lamports(target_uid))
+            bot.reply_to(m, f"✅ {fmt_sol_usdc(lam_val)} {op} für {target_uid}. Neues Guthaben: {nb}")
         return
 
     # Admin: broadcast all
     if ADMIN_AWAIT_TRADE_STATUS.get(uid, False):
         ADMIN_AWAIT_TRADE_STATUS[uid] = False
         if not is_admin(uid):
-            bot.reply_to(m, "Nicht erlaubt.")
-            return
+            bot.reply_to(m, "Nicht erlaubt."); return
         msg = text
         if not msg:
-            bot.reply_to(m, "Bitte Text senden.")
-            return
+            bot.reply_to(m, "Bitte Text senden."); return
         subs = all_subscribers()
         sent = 0
         for su in subs:
@@ -1244,26 +1346,21 @@ def catch_all(m: Message):
         bot.reply_to(m, f"✅ Nachricht gesendet an {sent} Abonnenten.")
         return
 
-    # Admin: import balances (multi-line)
+    # Admin: import balances
     if ADMIN_AWAIT_IMPORT_BALANCES.get(uid):
         ADMIN_AWAIT_IMPORT_BALANCES.pop(uid)
         if not is_admin(uid):
-            bot.reply_to(m, "Nicht erlaubt.")
-            return
+            bot.reply_to(m, "Nicht erlaubt."); return
         lines = text.splitlines()
         updated = 0
         for ln in lines:
             try:
-                if "UID" not in ln:
-                    continue
-                import re
+                if "UID" not in ln: continue
                 m_uid = re.search(r"UID\s*([0-9]+)", ln)
-                if not m_uid:
-                    continue
+                if not m_uid: continue
                 uid_num = int(m_uid.group(1))
                 m_amt = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*SOL", ln)
-                if not m_amt:
-                    continue
+                if not m_amt: continue
                 sol_amt = float(m_amt.group(1))
                 lam = int(sol_amt * LAMPORTS_PER_SOL)
                 upsert_user(uid_num, "", 1 if str(uid_num) in ADMIN_IDS else 0)
@@ -1274,7 +1371,7 @@ def catch_all(m: Message):
         bot.reply_to(m, f"Import abgeschlossen, aktualisierte Nutzer: {updated}")
         return
 
-    # Admin: support direct messaging flow
+    # Admin: support direct message flow (antwort senden)
     if ADMIN_AWAIT_NEWS_BROADCAST.get(uid):
         ctx = ADMIN_AWAIT_NEWS_BROADCAST[uid]
         step = ctx.get("step")
@@ -1296,19 +1393,21 @@ def catch_all(m: Message):
                     bot.send_photo(target, img, caption=direct_text, parse_mode="Markdown")
                 else:
                     bot.send_message(target, direct_text, parse_mode="Markdown")
-                bot.reply_to(m, "Support-Nachricht gesendet.")
+                bot.reply_to(m, "✅ Nachricht gesendet.")
             except Exception as e:
                 bot.reply_to(m, f"Fehler beim Senden: {e}")
             ADMIN_AWAIT_NEWS_BROADCAST.pop(uid, None)
             return
 
-    # Withdraw amount entry by user
+    # Withdraw-Eingabe: nur verarbeiten, wenn wirklich Zahl
     if WAITING_WITHDRAW_AMOUNT.get(uid) is None:
+        if not is_float_str(text.replace(",", ".")):
+            # nicht numerisch → ignorieren, kein „ungültige Zahl“-Spam
+            return
         try:
             sol = float(text.replace(",", "."))
             if sol <= 0:
-                bot.reply_to(m, "Betrag muss > 0 sein.")
-                return
+                bot.reply_to(m, "Betrag muss > 0 sein."); return
             lam = int(sol * LAMPORTS_PER_SOL)
             if get_balance_lamports(uid) < lam:
                 bot.reply_to(m, f"Unzureichendes Guthaben. Verfügbar: {fmt_sol_usdc(get_balance_lamports(uid))}")
@@ -1320,23 +1419,21 @@ def catch_all(m: Message):
             bot.reply_to(m, "Bitte eine gültige Zahl eingeben, z. B. 0.25.")
         return
 
-    # Admin: apply PnL / promo parsing
+    # Admin: apply PnL / promo parsing (mit negativen Werten)
     if ADMIN_AWAIT_PNL.get(uid, False):
         ADMIN_AWAIT_PNL[uid] = False
         if not is_admin(uid):
-            bot.reply_to(m, "Nicht erlaubt.")
-            return
+            bot.reply_to(m, "Nicht erlaubt."); return
         toks = text.split()
         if not toks:
-            bot.reply_to(m, "Kein Befehl erkannt.")
-            return
+            bot.reply_to(m, "Kein Befehl erkannt."); return
         try:
             cmd = toks[0].upper()
             if cmd == "PROMO":
-                typ = toks[1].upper()  # PERCENT or BONUS
+                typ = toks[1].upper()
                 val = float(toks[2])
                 scope = toks[3].upper() if len(toks) > 3 else "ALL"
-                affected = []
+                affected = 0
                 with get_db() as con:
                     if scope == "ALL":
                         rows = con.execute("SELECT user_id FROM users").fetchall()
@@ -1346,27 +1443,34 @@ def catch_all(m: Message):
                         rows = con.execute("SELECT user_id FROM users WHERE sub_types LIKE ?", (f"%{scope}%",)).fetchall()
                     else:
                         rows = []
-                    for r in rows:
-                        uid_t = int(row_get(r,"user_id",0))
-                        if typ == "PERCENT":
-                            bal = get_balance_lamports(uid_t)
-                            delta = int(bal * (val / 100.0))
-                            if delta != 0:
-                                add_balance(uid_t, delta)
-                                affected.append(uid_t)
-                        else:  # BONUS
-                            lam = int(val * LAMPORTS_PER_SOL)
-                            add_balance(uid_t, lam)
-                            affected.append(uid_t)
-                bot.reply_to(m, f"PROMO applied to {len(affected)} users.")
+                for r in rows:
+                    uid_t = int(row_get(r,"user_id",0))
+                    if typ == "PERCENT":
+                        if not (-100.0 <= val <= 100.0):
+                            continue
+                        bal = get_balance_lamports(uid_t)
+                        delta = int(bal * (val / 100.0))
+                        if delta != 0:
+                            add_balance(uid_t, delta); affected += 1
+                    else:  # BONUS (positiv gedacht)
+                        if val <= 0: continue
+                        lam = int(val * LAMPORTS_PER_SOL)
+                        add_balance(uid_t, lam); affected += 1
+                bot.reply_to(m, f"PROMO angewendet: {affected} Nutzer.")
                 return
+
             elif cmd == "PNL":
-                # PNL CALL_ID PERCENT -> apply profit percent to executions of a call, scaled by user risk
                 call_id = int(toks[1])
                 percent = float(toks[2])
+                if not (-100.0 <= percent <= 100.0):
+                    bot.reply_to(m, "Prozent außerhalb des Bereichs (−100 bis +100)."); return
                 affected = 0
                 with get_db() as con:
-                    execs = con.execute("SELECT user_id, stake_lamports FROM executions WHERE call_id=? AND status IN ('FILLED','QUEUED')", (call_id,)).fetchall()
+                    execs = con.execute("""
+                        SELECT user_id, stake_lamports
+                        FROM executions
+                        WHERE call_id=? AND status IN ('FILLED','QUEUED')
+                    """, (call_id,)).fetchall()
                 for ex in execs:
                     uid_t = int(row_get(ex,"user_id",0))
                     stake = int(row_get(ex,"stake_lamports",0))
@@ -1375,13 +1479,12 @@ def catch_all(m: Message):
                     frac = _risk_fraction(risk)
                     pnl_lam = int(stake * (percent / 100.0) * frac)
                     if pnl_lam != 0:
-                        add_balance(uid_t, pnl_lam)
-                        affected += 1
-                bot.reply_to(m, f"PNL applied to {affected} users for call {call_id}.")
+                        add_balance(uid_t, pnl_lam); affected += 1
+                bot.reply_to(m, f"PNL angewendet: {affected} Nutzer für Call {call_id}.")
                 return
+
             else:
-                bot.reply_to(m, "Unbekannter PNL/PROMO-Befehl.")
-                return
+                bot.reply_to(m, "Unbekannter PNL/PROMO-Befehl."); return
         except Exception as e:
             bot.reply_to(m, f"Fehler beim Anwenden: {e}")
             return
@@ -1390,7 +1493,7 @@ def catch_all(m: Message):
     bot.reply_to(m, "Ich habe das nicht verstanden. Benutze das Menü unten.", reply_markup=kb_main(get_user(uid)))
 
 # ---------------------------
-# Background loops: auto-executor & payout reminders
+# Background loops
 # ---------------------------
 def auto_executor_loop():
     while True:
