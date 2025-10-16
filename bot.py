@@ -29,7 +29,8 @@ CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "3wyVwpcbWt96mphJjskFsR2qoy
 EXCHANGE_WALLETS = set([s.strip() for s in os.getenv("EXCHANGE_WALLETS", "").split(",") if s.strip()])
 
 # Withdraw fee tiers (lockup_days: fee_percent)
-DEFAULT_FEE_TIERS = {5: 20.0, 7: 10.0, 10: 5.0}
+# 0 Tage = Sofort (20%), 5 Tage = 15%, 7 Tage = 10%, 10 Tage = 5%
+DEFAULT_FEE_TIERS = {0: 20.0, 5: 15.0, 7: 10.0, 10: 5.0}
 _fee_tiers: Dict[int, float] = {}
 raw_tiers = os.getenv("WITHDRAW_FEE_TIERS", "")
 if raw_tiers:
@@ -291,6 +292,16 @@ def get_balance_lamports(user_id: int) -> int:
         row = con.execute("SELECT sol_balance_lamports FROM users WHERE user_id=?", (user_id,)).fetchone()
         return row_get(row, "sol_balance_lamports", 0)
 
+# >>> NEU: Guthaben subtrahieren (für Reservierung bei Auszahlung)
+def subtract_balance(user_id: int, lamports: int) -> bool:
+    with get_db() as con:
+        row = con.execute("SELECT sol_balance_lamports FROM users WHERE user_id=?", (user_id,)).fetchone()
+        cur = row_get(row, "sol_balance_lamports", 0)
+        if cur < lamports:
+            return False
+        con.execute("UPDATE users SET sol_balance_lamports = sol_balance_lamports - ? WHERE user_id=?", (lamports, user_id))
+        return True
+
 def list_investors(limit: int = 50, offset: int = 0):
     with get_db() as con:
         return con.execute("""
@@ -427,10 +438,13 @@ def kb_user_row(user_id: int):
            InlineKeyboardButton("🧾 Payouts", callback_data=f"admin_payouts_{user_id}"))
     return kb
 
+# >>> ERSETZT: mit "Sofort • Fee 20%" integriert
 def kb_withdraw_options():
     kb = InlineKeyboardMarkup()
-    for days, pct in parse_fee_tiers():
-        kb.add(InlineKeyboardButton(f"{days} Tage • Fee {pct}%", callback_data=f"payoutopt_{days}"))
+    tiers = sorted(parse_fee_tiers(), key=lambda x: x[0])  # nach Tagen
+    for days, pct in tiers:
+        label = "Sofort • Fee 20%" if days == 0 else f"{days} Tage • Fee {pct}%"
+        kb.add(InlineKeyboardButton(label, callback_data=f"payoutopt_{days}"))
     kb.add(InlineKeyboardButton("↩️ Abbrechen", callback_data="back_home"))
     return kb
 
@@ -1077,6 +1091,151 @@ def on_cb(c: CallbackQuery):
         bot.answer_callback_query(c.id, "Sende jetzt z. B.:\n• `ALL -40%`\n• `PROMO PERCENT 20 ALL`\n• `PROMO BONUS 0.05 SUBSCRIBERS`\n• `PNL <CALL_ID> 20`",)
         return
 
+    # --- payout option chosen (Sofort / 5 / 7 / 10 Tage) ---
+    if data.startswith("payoutopt_"):
+        try:
+            days = int(data.split("_", 1)[1])
+        except Exception:
+            bot.answer_callback_query(c.id, "Ungültige Auswahl.")
+            return
+
+        fee_percent = float(_fee_tiers.get(days, 0.0))
+        pending = WAITING_WITHDRAW_AMOUNT.get(uid, None)
+        if pending is None or pending <= 0:
+            bot.answer_callback_query(c.id, "Keine ausstehende Auszahlung. Bitte Betrag zuerst eingeben.")
+            return
+
+        amount_lam = int(pending)
+        # Guthaben prüfen & sofort reservieren (abziehen)
+        if not subtract_balance(uid, amount_lam):
+            bot.answer_callback_query(c.id, "Unzureichendes Guthaben.")
+            WAITING_WITHDRAW_AMOUNT.pop(uid, None)
+            return
+
+        # Payout anlegen
+        with get_db() as con:
+            cur = con.execute(
+                "INSERT INTO payouts(user_id, amount_lamports, status, note, lockup_days, fee_percent) VALUES (?,?,?,?,?,?)",
+                (uid, amount_lam, "REQUESTED",
+                 f"User requested withdrawal ({days}d, fee {fee_percent}%)",
+                 days, fee_percent)
+            )
+            pid = cur.lastrowid
+
+        WAITING_WITHDRAW_AMOUNT.pop(uid, None)
+
+        fee_lam = int(round(amount_lam * (fee_percent / 100.0)))
+        net_lam = amount_lam - fee_lam
+
+        # Nutzer informieren
+        bot.answer_callback_query(c.id, "Auszahlung angefragt.")
+        try:
+            bot.send_message(
+                uid,
+                (
+                    "💸 *Auszahlung angefragt*\n"
+                    f"Betrag: {fmt_sol_usdc(amount_lam)}\n"
+                    f"Lockup: {days} Tage\n"
+                    f"Gebühr: {fee_percent:.2f}% ({fmt_sol_usdc(fee_lam)})\n"
+                    f"Netto (nach Fee): {fmt_sol_usdc(net_lam)}\n\n"
+                    "Du erhältst eine Bestätigung, sobald ein Admin sie bearbeitet hat."
+                ),
+                parse_mode="Markdown"
+            )
+        except Exception:
+            pass
+
+        # Admins benachrichtigen
+        for aid in ADMIN_IDS:
+            try:
+                bot.send_message(
+                    int(aid),
+                    (
+                        f"🧾 Neue Auszahlung #{pid}\n"
+                        f"User: {uid}\n"
+                        f"Betrag: {fmt_sol_usdc(amount_lam)}\n"
+                        f"Lockup: {days}d • Fee: {fee_percent:.2f}%\n"
+                        f"Netto: {fmt_sol_usdc(net_lam)}"
+                    ),
+                    reply_markup=kb_payout_manage(pid)
+                )
+            except Exception:
+                pass
+        return
+
+    # --- admin payout manage actions ---
+    if data.startswith("payout_"):
+        if not is_admin(uid):
+            bot.answer_callback_query(c.id, "Nicht erlaubt.")
+            return
+
+        parts = data.split("_", 2)
+        if len(parts) < 3:
+            bot.answer_callback_query(c.id, "Ungültig.")
+            return
+
+        action, sid = parts[1], parts[2]
+        try:
+            pid = int(sid)
+        except Exception:
+            bot.answer_callback_query(c.id, "Ungültige ID.")
+            return
+
+        with get_db() as con:
+            row = con.execute("SELECT * FROM payouts WHERE id=?", (pid,)).fetchone()
+
+        if not row:
+            bot.answer_callback_query(c.id, "Anfrage nicht gefunden.")
+            return
+
+        tgt_uid = int(row_get(row, "user_id", 0))
+        amt = int(row_get(row, "amount_lamports", 0))
+        days = int(row_get(row, "lockup_days", 0))
+        fee_percent = float(row_get(row, "fee_percent", 0.0))
+        fee_lam = int(round(amt * (fee_percent / 100.0)))
+        net_lam = amt - fee_lam
+
+        if action == "APPROVE":
+            with get_db() as con:
+                con.execute("UPDATE payouts SET status='APPROVED' WHERE id=?", (pid,))
+            bot.answer_callback_query(c.id, "Genehmigt.")
+            try:
+                bot.send_message(tgt_uid, f"✅ Deine Auszahlung #{pid} wurde *genehmigt*. Auszahlung folgt.", parse_mode="Markdown")
+            except Exception:
+                pass
+            return
+
+        if action == "SENT":
+            with get_db() as con:
+                con.execute("UPDATE payouts SET status='SENT' WHERE id=?", (pid,))
+            bot.answer_callback_query(c.id, "Als gesendet markiert.")
+            try:
+                bot.send_message(
+                    tgt_uid,
+                    (
+                        f"📤 Deine Auszahlung #{pid} wurde *gesendet*.\n"
+                        f"Betrag: {fmt_sol_usdc(amt)}\n"
+                        f"Gebühr: {fee_percent:.2f}% ({fmt_sol_usdc(fee_lam)})\n"
+                        f"Netto: {fmt_sol_usdc(net_lam)}"
+                    ),
+                    parse_mode="Markdown"
+                )
+            except Exception:
+                pass
+            return
+
+        if action == "REJECT":
+            # Betrag wieder gut schreiben (weil bei Request reserviert)
+            with get_db() as con:
+                con.execute("UPDATE payouts SET status='REJECTED' WHERE id=?", (pid,))
+            add_balance(tgt_uid, amt)
+            bot.answer_callback_query(c.id, "Abgelehnt und Betrag erstattet.")
+            try:
+                bot.send_message(tgt_uid, f"❌ Deine Auszahlung #{pid} wurde *abgelehnt*. Betrag wurde zurückerstattet.", parse_mode="Markdown")
+            except Exception:
+                pass
+            return
+
     bot.answer_callback_query(c.id, "")
 
 @bot.message_handler(func=lambda m: True)
@@ -1125,7 +1284,6 @@ def catch_all(m: Message):
 
     # --- User: Source/Payout Wallet Eingaben im Flow (ohne extra Menü) ---
     if WAITING_SOURCE_WALLET.get(uid, False):
-        # wenn der Nutzer gerade einzahlen/Quelle aktualisiert
         if is_probably_solana_address(text):
             WAITING_SOURCE_WALLET[uid] = False
             set_source_wallet(uid, text)
@@ -1133,7 +1291,6 @@ def catch_all(m: Message):
             px = f"(1 SOL ≈ {price:.2f} USDC)" if price > 0 else ""
             bot.reply_to(m, f"✅ Absender-Wallet gespeichert.\nSende SOL von `{md_escape(text)}` an `{md_escape(CENTRAL_SOL_PUBKEY)}`\n{px}", parse_mode="Markdown")
             return
-        # wenn keine Adresse → ignoriere und falle nicht durch
     if WAITING_PAYOUT_WALLET.get(uid, False):
         if is_probably_solana_address(text):
             WAITING_PAYOUT_WALLET[uid] = False
@@ -1201,7 +1358,6 @@ def catch_all(m: Message):
         try:
             # 1) ALL -40%
             if cmd.upper().startswith("ALL"):
-                # Muster: ALL <±PCT>%
                 parts = cmd.split()
                 if len(parts) != 2 or not parts[1].endswith("%"):
                     bot.reply_to(m, "Format: `ALL -40%` oder `ALL +25%`")
