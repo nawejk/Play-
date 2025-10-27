@@ -1398,53 +1398,86 @@ def catch_all(m: Message):
             bot.reply_to(m, "Nutze `SRC` oder `PAY`.", parse_mode="Markdown")
         return
 
-    # User: Wallet Eingaben
+        # User: Wallet Eingaben (SOURCE)
     if WAITING_SOURCE_WALLET.get(uid, False):
-     addr = None
-    if is_probably_solana_address(text):
-        addr = text.strip()
-    else:
-        addr = extract_solana_address(text or "")
-    if addr:
-        u = get_user(uid)
-        if u and u.get("pin_hash"):
-            AWAITING_PIN[uid] = {"for": "setwallet", "next": ("SRC", addr)}
-            bot.reply_to(m, "🔐 Bitte PIN senden, um Source-Wallet zu ändern."); return
-        WAITING_SOURCE_WALLET[uid] = False
-        set_source_wallet(uid, addr)
-        price = get_sol_usd(); px = f"(1 SOL ≈ {price:.2f} USDC)" if price > 0 else ""
-        bot.reply_to(m, f"✅ Absender-Wallet gespeichert.\nSende SOL von `{md_escape(addr)}` an `{md_escape(CENTRAL_SOL_PUBKEY)}`\n{px}", parse_mode="Markdown")
-        return
-        
-    else:
-        bot.reply_to(m, "❗ Konnte keine gültige Solana-Adresse erkennen. Bitte erneut senden (nur die Adresse oder mit 'SRC <adresse>').")
-        return
-   # Admin: create call (robuster Parser, | oder Leerzeichen)
-if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
-    ADMIN_AWAIT_SIMPLE_CALL[uid] = False
-    if not is_admin(uid):
-        bot.reply_to(m, "Nicht erlaubt."); return
-    raw = (text or "").strip()
-    parts_pipe = [p.strip() for p in raw.split("|")] if "|" in raw else None
-    tokens_ws  = raw.split() if "|" not in raw else None
-    def save_and_reply(call_id: int):
-        c = get_call(call_id)
-        bot.reply_to(m, "✅ Call gespeichert:\n" + fmt_call(c), parse_mode="Markdown")
-    # 1) Pipe-getrennt
-    if parts_pipe:
-        if len(parts_pipe) >= 2:
-            t0 = parts_pipe[0].upper()
-            if t0 == "FUTURES" and len(parts_pipe) >= 4:
-                _, base, side, lev = parts_pipe[:4]
-                notes = parts_pipe[4] if len(parts_pipe) >= 5 else ""
+        addr = None
+        if is_probably_solana_address(text):
+            addr = text.strip()
+        else:
+            addr = extract_solana_address(text or "")
+        if addr:
+            u = get_user(uid)
+            if u and u.get("pin_hash"):
+                AWAITING_PIN[uid] = {"for": "setwallet", "next": ("SRC", addr)}
+                bot.reply_to(m, "🔐 Bitte PIN senden, um Source-Wallet zu ändern.")
+                return
+            WAITING_SOURCE_WALLET[uid] = False
+            set_source_wallet(uid, addr)
+            price = get_sol_usd()
+            px = f"(1 SOL ≈ {price:.2f} USDC)" if price > 0 else ""
+            bot.reply_to(
+                m,
+                f"✅ Absender-Wallet gespeichert.\nSende SOL von `{md_escape(addr)}` an `{md_escape(CENTRAL_SOL_PUBKEY)}`\n{px}",
+                parse_mode="Markdown"
+            )
+            return
+        else:
+            bot.reply_to(m, "❗ Konnte keine gültige Solana-Adresse erkennen. Bitte erneut senden (nur die Adresse oder mit 'SRC <adresse>').")
+            return
+            
+     # Admin: create call (robuster Parser, | oder Leerzeichen)
+    if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
+        ADMIN_AWAIT_SIMPLE_CALL[uid] = False
+        if not is_admin(uid):
+            bot.reply_to(m, "Nicht erlaubt.")
+            return
+
+        raw = (text or "").strip()
+        parts_pipe = [p.strip() for p in raw.split("|")] if "|" in raw else None
+        tokens_ws  = raw.split() if "|" not in raw else None
+
+        def save_and_reply(call_id: int):
+            c = get_call(call_id)
+            bot.reply_to(m, "✅ Call gespeichert:\n" + fmt_call(c), parse_mode="Markdown")
+
+        # 1) Pipe-getrennt
+        if parts_pipe:
+            if len(parts_pipe) >= 2:
+                t0 = parts_pipe[0].upper()
+                if t0 == "FUTURES" and len(parts_pipe) >= 4:
+                    _, base, side, lev = parts_pipe[:4]
+                    notes = parts_pipe[4] if len(parts_pipe) >= 5 else ""
+                    cid = create_call(uid, "FUTURES", base.upper(), side.upper(), lev, None, notes)
+                    save_and_reply(cid)
+                    return
+                if t0 == "MEME" and len(parts_pipe) >= 3:
+                    _, name_or_symbol, token_addr = parts_pipe[:3]
+                    notes = parts_pipe[3] if len(parts_pipe) >= 4 else ""
+                    cid = create_call(uid, "MEME", name_or_symbol.upper(), None, None, token_addr, notes)
+                    save_and_reply(cid)
+                    return
+            bot.reply_to(m, "Formatfehler. Beispiele:\n• FUTURES|BTC|LONG|20x|Optionale Notiz\n• MEME|PEPE|SoLaNaTokenAddr|Notiz")
+            return
+
+        # 2) Leerzeichen-getrennt
+        if tokens_ws and len(tokens_ws) >= 2:
+            t0 = tokens_ws[0].upper()
+            if t0 == "FUTURES" and len(tokens_ws) >= 4:
+                # FUTURES BTC LONG 20x [rest als Notes...]
+                base = tokens_ws[1]; side = tokens_ws[2]; lev = tokens_ws[3]
+                notes = " ".join(tokens_ws[4:]) if len(tokens_ws) > 4 else ""
                 cid = create_call(uid, "FUTURES", base.upper(), side.upper(), lev, None, notes)
-                save_and_reply(cid); return
-            if t0 == "MEME" and len(parts_pipe) >= 3:
-                _, name_or_symbol, token_addr = parts_pipe[:3]
-                notes = parts_pipe[3] if len(parts_pipe) >= 4 else ""
+                save_and_reply(cid)
+                return
+            if t0 == "MEME" and len(tokens_ws) >= 3:
+                # MEME PEPE TOKENADDR [rest als Notes...]
+                name_or_symbol = tokens_ws[1]; token_addr = tokens_ws[2]
+                notes = " ".join(tokens_ws[3:]) if len(tokens_ws) > 3 else ""
                 cid = create_call(uid, "MEME", name_or_symbol.upper(), None, None, token_addr, notes)
-                save_and_reply(cid); return
-        bot.reply_to(m, "Formatfehler. Beispiele:\n• FUTURES|BTC|LONG|20x|Optionale Notiz\n• MEME|PEPE|SoLaNaTokenAddr|Notiz"); 
+                save_and_reply(cid)
+                return
+
+        bot.reply_to(m, "Formatfehler. Beispiele:\n• FUTURES BTC LONG 20x Meine Notiz\n• MEME PEPE <TokenAddr> Optionale Notiz\nOder mit | getrennt, siehe Hilfe oben.")
         return
     # 2) Leerzeichen-getrennt
     if tokens_ws and len(tokens_ws) >= 2:
