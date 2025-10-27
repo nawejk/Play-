@@ -1400,7 +1400,7 @@ def catch_all(m: Message):
 
     # User: Wallet Eingaben
     if WAITING_SOURCE_WALLET.get(uid, False):
-    addr = None
+     addr = None
     if is_probably_solana_address(text):
         addr = text.strip()
     else:
