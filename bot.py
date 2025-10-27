@@ -1375,25 +1375,30 @@ def catch_all(m: Message):
         return
 
     # PIN erwartet?
-    if AWAITING_PIN.get(uid):
-        entry = AWAITING_PIN.pop(uid)
-        pin = text
-        u = get_user(uid)
-            if not (u and rget(u, "pin_hash") and _hash_pin(pin) == rget(u, "pin_hash")):
-            bot.reply_to(m, "❌ Falsche PIN."); return
-        if entry["for"] == "withdraw_option":
-            class _DummyC: pass
-            dummy = _DummyC(); dummy.data = entry["data"]; dummy.message = m; dummy.id = "pin-ok"
-            return _do_payout_option(uid, dummy)
-        if entry["for"] == "setwallet":
-            which, addr = entry["next"]
-            if which == "SRC":
-                set_source_wallet(uid, addr)
-                bot.reply_to(m, f"✅ Source-Wallet gespeichert: `{md_escape(addr)}`", parse_mode="Markdown")
-            else:
-                set_payout_wallet(uid, addr)
-                bot.reply_to(m, f"✅ Payout-Wallet gespeichert: `{md_escape(addr)}`", parse_mode="Markdown")
-            return
+if AWAITING_PIN.get(uid):
+    entry = AWAITING_PIN.pop(uid)
+    pin = text
+    u = get_user(uid)
+    if not (u and rget(u, "pin_hash") and _hash_pin(pin) == rget(u, "pin_hash")):
+        bot.reply_to(m, "❌ Falsche PIN.")
+        return
+    if entry["for"] == "withdraw_option":
+        class _DummyC: 
+            pass
+        dummy = _DummyC()
+        dummy.data = entry["data"]
+        dummy.message = m
+        dummy.id = "pin-ok"
+        return _do_payout_option(uid, dummy)
+    if entry["for"] == "setwallet":
+        which, addr = entry["next"]
+        if which == "SRC":
+            set_source_wallet(uid, addr)
+            bot.reply_to(m, f"✅ Source-Wallet gespeichert: `{md_escape(addr)}`", parse_mode="Markdown")
+        else:
+            set_payout_wallet(uid, addr)
+            bot.reply_to(m, f"✅ Payout-Wallet gespeichert: `{md_escape(addr)}`", parse_mode="Markdown")
+        return
 
     # Admin: Set wallet eines anderen Users
     if ADMIN_AWAIT_SET_WALLET.get(uid):
