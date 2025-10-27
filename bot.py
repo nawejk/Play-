@@ -1419,7 +1419,6 @@ def catch_all(m: Message):
     else:
         bot.reply_to(m, "❗ Konnte keine gültige Solana-Adresse erkennen. Bitte erneut senden (nur die Adresse oder mit 'SRC <adresse>').")
         return
-
    # Admin: create call (robuster Parser, | oder Leerzeichen)
 if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
     ADMIN_AWAIT_SIMPLE_CALL[uid] = False
@@ -1428,11 +1427,9 @@ if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
     raw = (text or "").strip()
     parts_pipe = [p.strip() for p in raw.split("|")] if "|" in raw else None
     tokens_ws  = raw.split() if "|" not in raw else None
-
     def save_and_reply(call_id: int):
         c = get_call(call_id)
         bot.reply_to(m, "✅ Call gespeichert:\n" + fmt_call(c), parse_mode="Markdown")
-
     # 1) Pipe-getrennt
     if parts_pipe:
         if len(parts_pipe) >= 2:
@@ -1449,7 +1446,6 @@ if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
                 save_and_reply(cid); return
         bot.reply_to(m, "Formatfehler. Beispiele:\n• FUTURES|BTC|LONG|20x|Optionale Notiz\n• MEME|PEPE|SoLaNaTokenAddr|Notiz"); 
         return
-
     # 2) Leerzeichen-getrennt
     if tokens_ws and len(tokens_ws) >= 2:
         t0 = tokens_ws[0].upper()
@@ -1465,10 +1461,8 @@ if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
             notes = " ".join(tokens_ws[3:]) if len(tokens_ws) > 3 else ""
             cid = create_call(uid, "MEME", name_or_symbol.upper(), None, None, token_addr, notes)
             save_and_reply(cid); return
-
     bot.reply_to(m, "Formatfehler. Beispiele:\n• FUTURES BTC LONG 20x Meine Notiz\n• MEME PEPE <TokenAddr> Optionale Notiz\nOder mit | getrennt, siehe Hilfe oben.")
     return
-
     # Admin: balance edit (per-user)
     if ADMIN_AWAIT_BALANCE_SINGLE.get(uid) is not None:
         target = ADMIN_AWAIT_BALANCE_SINGLE.pop(uid)
@@ -1492,7 +1486,6 @@ if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
         except Exception:
             bot.reply_to(m, "Bitte Zahl (z. B. 0.25) oder Prozent (z. B. -40%) senden.")
         return
-
     # Admin: balance edit global / mass ops / promo / pnl
     if ADMIN_AWAIT_BALANCE_GLOBAL.get(uid, False) or ADMIN_AWAIT_MASS_BALANCE.get(uid, False):
         is_mass = ADMIN_AWAIT_MASS_BALANCE.get(uid, False)
@@ -1533,7 +1526,6 @@ if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
                         add_balance(uid_t, lam); log_tx(uid_t, "ADJ", lam, meta=f"promo {val} SOL")
                     affected += 1
                 bot.reply_to(m, f"✅ PROMO auf {affected} Nutzer."); return
-
             if verb == "PNL":
                 call_id = int(toks[1]); percent = float(toks[2]); affected = 0
                 with get_db() as con:
@@ -1546,7 +1538,6 @@ if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
                     add_balance(uid_t, pnl_lam); log_tx(uid_t, "PNL", pnl_lam, ref_id=str(call_id), meta=f"{percent:+.2f}% * {frac:.2f}")
                     affected += 1
                 bot.reply_to(m, f"✅ PNL (Call {call_id}) auf {affected} Nutzer."); return
-
             toks = cmd.split()
             if len(toks) < 2:
                 bot.reply_to(m, "Format: UID 12345 0.25 oder @username -40%"); return
@@ -1564,7 +1555,6 @@ if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
                 target_id = int(r["user_id"]); value_token = toks[1]
             else:
                 bot.reply_to(m, "Zuerst UID <id> oder @username angeben."); return
-
             t = value_token.replace(" ", "")
             if t.endswith("%"):
                 pct = float(t[:-1].replace(",", "."))
@@ -1583,7 +1573,6 @@ if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
         except Exception as e:
             bot.reply_to(m, f"Fehler: {e}")
         return
-
     # Admin: Broadcast to ALL
     if ADMIN_AWAIT_NEWS_BROADCAST.get(uid):
         ctx = ADMIN_AWAIT_NEWS_BROADCAST.pop(uid, None)
@@ -1598,7 +1587,6 @@ if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
                     sent += 1
                 except Exception: pass
             bot.reply_to(m, f"✅ Broadcast an {sent} Nutzer gesendet."); return
-
     # Withdraw amount entry
     if WAITING_WITHDRAW_AMOUNT.get(uid) is None:
         if is_probably_solana_address(text):
