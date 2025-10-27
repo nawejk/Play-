@@ -1400,18 +1400,6 @@ def catch_all(m: Message):
 
     # User: Wallet Eingaben
     if WAITING_SOURCE_WALLET.get(uid, False):
-        if is_probably_solana_address(text):
-            u = get_user(uid)
-            if u and u.get("pin_hash"):
-                AWAITING_PIN[uid] = {"for": "setwallet", "next": ("SRC", text)}
-                bot.reply_to(m, "🔐 Bitte PIN senden, um Source-Wallet zu ändern."); return
-            WAITING_SOURCE_WALLET[uid] = False
-            set_source_wallet(uid, text)
-            price = get_sol_usd(); px = f"(1 SOL ≈ {price:.2f} USDC)" if price > 0 else ""
-            bot.reply_to(m, f"✅ Absender-Wallet gespeichert.\nSende SOL von `{md_escape(text)}` an `{md_escape(CENTRAL_SOL_PUBKEY)}`\n{px}", parse_mode="Markdown")
-            return
-    
-    if WAITING_SOURCE_WALLET.get(uid, False):
     addr = None
     if is_probably_solana_address(text):
         addr = text.strip()
