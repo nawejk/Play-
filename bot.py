@@ -119,7 +119,18 @@ def extract_solana_address(text: str) -> Optional[str]:
 def gen_referral_for_user(user_id: int) -> str:
     h = hashlib.sha1(str(user_id).encode()).hexdigest()[:8]
     return f"REF{h.upper()}"
-
+def rget(row, key, default=None):
+    """
+    Sicherer Getter für sqlite3.Row und dicts.
+    Liefert default, wenn Key fehlt oder Wert None ist.
+    """
+    if row is None:
+        return default
+    try:
+        v = row[key]
+        return v if v is not None else default
+    except Exception:
+        return default
 # ---------------------------
 # DB schema & helpers
 # ---------------------------
@@ -360,12 +371,19 @@ def queue_execution(call_id: int, user_id: int, status: str = "QUEUED", message:
         return cur.lastrowid
 
 def fmt_call(c) -> str:
-    if c["market_type"] == "FUTURES":
-        core = f"Futures • {c['base']} • {(c.get('side') or '')} {(c.get('leverage') or '')}".strip()
+    # funktioniert für sqlite3.Row und dict
+    market_type = rget(c, "market_type", "")
+    base = rget(c, "base", "")
+    if market_type == "FUTURES":
+        side = rget(c, "side", "")
+        lev = rget(c, "leverage", "")
+        core = f"Futures • {base} • {side} {lev}".strip()
     else:
-        core = f"MEME • {c['base']}"
-    extra = f"\nToken: `{md_escape(c.get('token_address') or '')}`" if (c["market_type"] == "MEME" and c.get("token_address")) else ""
-    note = f"\nNotes: {md_escape(c.get('notes') or '')}" if c.get("notes") else ""
+        core = f"MEME • {base}"
+    token_addr = rget(c, "token_address", "")
+    notes = rget(c, "notes", "")
+    extra = f"\nToken: `{md_escape(token_addr)}`" if (market_type == "MEME" and token_addr) else ""
+    note = f"\nNotes: {md_escape(notes)}" if notes else ""
     return f"🧩 *{core}*{extra}{note}"
 
 # ---------------------------
@@ -1361,7 +1379,7 @@ def catch_all(m: Message):
         entry = AWAITING_PIN.pop(uid)
         pin = text
         u = get_user(uid)
-        if not (u and u.get("pin_hash") and _hash_pin(pin) == u["pin_hash"]):
+            if not (u and rget(u, "pin_hash") and _hash_pin(pin) == rget(u, "pin_hash")):
             bot.reply_to(m, "❌ Falsche PIN."); return
         if entry["for"] == "withdraw_option":
             class _DummyC: pass
@@ -1407,7 +1425,7 @@ def catch_all(m: Message):
             addr = extract_solana_address(text or "")
         if addr:
             u = get_user(uid)
-            if u and u.get("pin_hash"):
+                if u and rget(u, "pin_hash"):
                 AWAITING_PIN[uid] = {"for": "setwallet", "next": ("SRC", addr)}
                 bot.reply_to(m, "🔐 Bitte PIN senden, um Source-Wallet zu ändern.")
                 return
@@ -1624,7 +1642,7 @@ def catch_all(m: Message):
     if WAITING_WITHDRAW_AMOUNT.get(uid) is None:
         if is_probably_solana_address(text):
             u = get_user(uid)
-            if u and u.get("pin_hash"):
+                if u and rget(u, "pin_hash"):
                 AWAITING_PIN[uid] = {"for": "setwallet", "next": ("PAY", text)}
                 bot.reply_to(m, "🔐 Bitte PIN senden, um Payout-Wallet zu ändern."); return
             set_payout_wallet(uid, text)
