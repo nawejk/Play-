@@ -1425,7 +1425,6 @@ if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
     ADMIN_AWAIT_SIMPLE_CALL[uid] = False
     if not is_admin(uid):
         bot.reply_to(m, "Nicht erlaubt."); return
-
     raw = (text or "").strip()
     parts_pipe = [p.strip() for p in raw.split("|")] if "|" in raw else None
     tokens_ws  = raw.split() if "|" not in raw else None
