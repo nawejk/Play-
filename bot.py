@@ -1357,9 +1357,11 @@ def catch_all(m: Message):
                 if m.photo:
                     bot.send_photo(int(aid), m.photo[-1].file_id, caption=f"[Support von {name} ({uid})] {m.caption or ''}")
                 else:
-                    bot.send_message(int(aid), f"[Support von {name} ({uid})] {text}")
-            except Exception: pass
-        bot.reply_to(m, "✅ Deine Support-Nachricht wurde an die Admins gesendet."); return
+                    bot.send_message(int(aid), f"[Support von {name} ({uid})] {text}", parse_mode=None)
+            except Exception:
+                pass
+        bot.reply_to(m, "✅ Deine Support-Nachricht wurde an die Admins gesendet.")
+        return
 
     # Admin: Direct Message Versand
     if ADMIN_AWAIT_DM_TARGET.get(uid):
@@ -1375,42 +1377,46 @@ def catch_all(m: Message):
         return
 
     # PIN erwartet?
-if AWAITING_PIN.get(uid):
-    entry = AWAITING_PIN.pop(uid)
-    pin = text
-    u = get_user(uid)
-    if not (u and rget(u, "pin_hash") and _hash_pin(pin) == rget(u, "pin_hash")):
-        bot.reply_to(m, "❌ Falsche PIN.")
-        return
-    if entry["for"] == "withdraw_option":
-        class _DummyC: 
-            pass
-        dummy = _DummyC()
-        dummy.data = entry["data"]
-        dummy.message = m
-        dummy.id = "pin-ok"
-        return _do_payout_option(uid, dummy)
-    if entry["for"] == "setwallet":
-        which, addr = entry["next"]
-        if which == "SRC":
-            set_source_wallet(uid, addr)
-            bot.reply_to(m, f"✅ Source-Wallet gespeichert: `{md_escape(addr)}`", parse_mode="Markdown")
-        else:
-            set_payout_wallet(uid, addr)
-            bot.reply_to(m, f"✅ Payout-Wallet gespeichert: `{md_escape(addr)}`", parse_mode="Markdown")
-        return
+    if AWAITING_PIN.get(uid):
+        entry = AWAITING_PIN.pop(uid)
+        pin = text
+        u = get_user(uid)
+        if not (u and rget(u, "pin_hash") and _hash_pin(pin) == rget(u, "pin_hash")):
+            bot.reply_to(m, "❌ Falsche PIN.")
+            return
+        if entry["for"] == "withdraw_option":
+            class _DummyC:
+                pass
+            dummy = _DummyC()
+            dummy.data = entry["data"]
+            dummy.message = m
+            dummy.id = "pin-ok"
+            _do_payout_option(uid, dummy)
+            return
+        if entry["for"] == "setwallet":
+            which, addr = entry["next"]
+            if which == "SRC":
+                set_source_wallet(uid, addr)
+                bot.reply_to(m, f"✅ Source-Wallet gespeichert: `{md_escape(addr)}`", parse_mode="Markdown")
+            else:
+                set_payout_wallet(uid, addr)
+                bot.reply_to(m, f"✅ Payout-Wallet gespeichert: `{md_escape(addr)}`", parse_mode="Markdown")
+            return
 
     # Admin: Set wallet eines anderen Users
     if ADMIN_AWAIT_SET_WALLET.get(uid):
         target = ADMIN_AWAIT_SET_WALLET.pop(uid)
         if not is_admin(uid):
-            bot.reply_to(m, "Nicht erlaubt."); return
+            bot.reply_to(m, "Nicht erlaubt.")
+            return
         parts = text.split(None, 1)
         if len(parts) != 2:
-            bot.reply_to(m, "Format: `SRC <adresse>` oder `PAY <adresse>`", parse_mode="Markdown"); return
+            bot.reply_to(m, "Format: `SRC <adresse>` oder `PAY <adresse>`", parse_mode="Markdown")
+            return
         which, addr = parts[0].upper(), parts[1].strip()
         if not is_probably_solana_address(addr):
-            bot.reply_to(m, "Ungültige Solana-Adresse."); return
+            bot.reply_to(m, "Ungültige Solana-Adresse.")
+            return
         if which == "SRC":
             set_source_wallet(target, addr)
             bot.reply_to(m, f"✅ Source-Wallet für UID {target} gesetzt: `{md_escape(addr)}`", parse_mode="Markdown")
@@ -1421,114 +1427,73 @@ if AWAITING_PIN.get(uid):
             bot.reply_to(m, "Nutze `SRC` oder `PAY`.", parse_mode="Markdown")
         return
 
-        # User: Wallet Eingaben (SOURCE)
+    # User: Wallet Eingaben
     if WAITING_SOURCE_WALLET.get(uid, False):
-        addr = None
         if is_probably_solana_address(text):
-            addr = text.strip()
-        else:
-            addr = extract_solana_address(text or "")
-        if addr:
             u = get_user(uid)
-                if u and rget(u, "pin_hash"):
-                AWAITING_PIN[uid] = {"for": "setwallet", "next": ("SRC", addr)}
+            if u and rget(u, "pin_hash"):
+                AWAITING_PIN[uid] = {"for": "setwallet", "next": ("SRC", text)}
                 bot.reply_to(m, "🔐 Bitte PIN senden, um Source-Wallet zu ändern.")
                 return
             WAITING_SOURCE_WALLET[uid] = False
-            set_source_wallet(uid, addr)
+            set_source_wallet(uid, text)
             price = get_sol_usd()
             px = f"(1 SOL ≈ {price:.2f} USDC)" if price > 0 else ""
-            bot.reply_to(
-                m,
-                f"✅ Absender-Wallet gespeichert.\nSende SOL von `{md_escape(addr)}` an `{md_escape(CENTRAL_SOL_PUBKEY)}`\n{px}",
-                parse_mode="Markdown"
-            )
+            bot.reply_to(m, f"✅ Absender-Wallet gespeichert.\nSende SOL von `{md_escape(text)}` an `{md_escape(CENTRAL_SOL_PUBKEY)}`\n{px}", parse_mode="Markdown")
             return
-        else:
-            bot.reply_to(m, "❗ Konnte keine gültige Solana-Adresse erkennen. Bitte erneut senden (nur die Adresse oder mit 'SRC <adresse>').")
+
+    if WAITING_PAYOUT_WALLET.get(uid, False):
+        if is_probably_solana_address(text):
+            u = get_user(uid)
+            if u and rget(u, "pin_hash"):
+                AWAITING_PIN[uid] = {"for": "setwallet", "next": ("PAY", text)}
+                bot.reply_to(m, "🔐 Bitte PIN senden, um Payout-Wallet zu ändern.")
+                return
+            WAITING_PAYOUT_WALLET[uid] = False
+            set_payout_wallet(uid, text)
+            bot.reply_to(m, f"✅ Auszahlungsadresse gespeichert: `{md_escape(text)}`\nGib nun den Betrag in SOL ein (z. B. 0.25).", parse_mode="Markdown")
+            WAITING_WITHDRAW_AMOUNT[uid] = None
             return
-            
-     # Admin: create call (robuster Parser, | oder Leerzeichen)
+
+    # Admin: create call (mit optionalen Notes)
     if ADMIN_AWAIT_SIMPLE_CALL.get(uid, False):
         ADMIN_AWAIT_SIMPLE_CALL[uid] = False
         if not is_admin(uid):
             bot.reply_to(m, "Nicht erlaubt.")
             return
-
-        raw = (text or "").strip()
-        parts_pipe = [p.strip() for p in raw.split("|")] if "|" in raw else None
-        tokens_ws  = raw.split() if "|" not in raw else None
-
-        def save_and_reply(call_id: int):
-            c = get_call(call_id)
-            bot.reply_to(m, "✅ Call gespeichert:\n" + fmt_call(c), parse_mode="Markdown")
-
-        # 1) Pipe-getrennt
-        if parts_pipe:
-            if len(parts_pipe) >= 2:
-                t0 = parts_pipe[0].upper()
-                if t0 == "FUTURES" and len(parts_pipe) >= 4:
-                    _, base, side, lev = parts_pipe[:4]
-                    notes = parts_pipe[4] if len(parts_pipe) >= 5 else ""
-                    cid = create_call(uid, "FUTURES", base.upper(), side.upper(), lev, None, notes)
-                    save_and_reply(cid)
-                    return
-                if t0 == "MEME" and len(parts_pipe) >= 3:
-                    _, name_or_symbol, token_addr = parts_pipe[:3]
-                    notes = parts_pipe[3] if len(parts_pipe) >= 4 else ""
-                    cid = create_call(uid, "MEME", name_or_symbol.upper(), None, None, token_addr, notes)
-                    save_and_reply(cid)
-                    return
-            bot.reply_to(m, "Formatfehler. Beispiele:\n• FUTURES|BTC|LONG|20x|Optionale Notiz\n• MEME|PEPE|SoLaNaTokenAddr|Notiz")
+        parts = [p.strip() for p in (text or "").split("|")]
+        if len(parts) < 2:
+            bot.reply_to(m, "Formatfehler.")
             return
-
-        # 2) Leerzeichen-getrennt
-        if tokens_ws and len(tokens_ws) >= 2:
-            t0 = tokens_ws[0].upper()
-            if t0 == "FUTURES" and len(tokens_ws) >= 4:
-                # FUTURES BTC LONG 20x [rest als Notes...]
-                base = tokens_ws[1]; side = tokens_ws[2]; lev = tokens_ws[3]
-                notes = " ".join(tokens_ws[4:]) if len(tokens_ws) > 4 else ""
-                cid = create_call(uid, "FUTURES", base.upper(), side.upper(), lev, None, notes)
-                save_and_reply(cid)
-                return
-            if t0 == "MEME" and len(tokens_ws) >= 3:
-                # MEME PEPE TOKENADDR [rest als Notes...]
-                name_or_symbol = tokens_ws[1]; token_addr = tokens_ws[2]
-                notes = " ".join(tokens_ws[3:]) if len(tokens_ws) > 3 else ""
-                cid = create_call(uid, "MEME", name_or_symbol.upper(), None, None, token_addr, notes)
-                save_and_reply(cid)
-                return
-
-        bot.reply_to(m, "Formatfehler. Beispiele:\n• FUTURES BTC LONG 20x Meine Notiz\n• MEME PEPE <TokenAddr> Optionale Notiz\nOder mit | getrennt, siehe Hilfe oben.")
-        return
-    # 2) Leerzeichen-getrennt
-    if tokens_ws and len(tokens_ws) >= 2:
-        t0 = tokens_ws[0].upper()
-        if t0 == "FUTURES" and len(tokens_ws) >= 4:
-            # FUTURES BTC LONG 20x [rest als Notes...]
-            base = tokens_ws[1]; side = tokens_ws[2]; lev = tokens_ws[3]
-            notes = " ".join(tokens_ws[4:]) if len(tokens_ws) > 4 else ""
+        t0 = parts[0].upper()
+        if t0 == "FUTURES" and len(parts) >= 4:
+            _, base, side, lev = parts[:4]
+            notes = parts[4] if len(parts) >= 5 else ""
             cid = create_call(uid, "FUTURES", base.upper(), side.upper(), lev, None, notes)
-            save_and_reply(cid); return
-        if t0 == "MEME" and len(tokens_ws) >= 3:
-            # MEME PEPE TOKENADDR [rest als Notes...]
-            name_or_symbol = tokens_ws[1]; token_addr = tokens_ws[2]
-            notes = " ".join(tokens_ws[3:]) if len(tokens_ws) > 3 else ""
+            c = get_call(cid)
+            bot.reply_to(m, "✅ Call gespeichert:\n" + fmt_call(c), parse_mode="Markdown")
+        elif t0 == "MEME" and len(parts) >= 3:
+            _, name_or_symbol, token_addr = parts[:3]
+            notes = parts[3] if len(parts) >= 4 else ""
             cid = create_call(uid, "MEME", name_or_symbol.upper(), None, None, token_addr, notes)
-            save_and_reply(cid); return
-    bot.reply_to(m, "Formatfehler. Beispiele:\n• FUTURES BTC LONG 20x Meine Notiz\n• MEME PEPE <TokenAddr> Optionale Notiz\nOder mit | getrennt, siehe Hilfe oben.")
-    return
+            c = get_call(cid)
+            bot.reply_to(m, "✅ Call gespeichert:\n" + fmt_call(c), parse_mode="Markdown")
+        else:
+            bot.reply_to(m, "Formatfehler.")
+        return
+
     # Admin: balance edit (per-user)
     if ADMIN_AWAIT_BALANCE_SINGLE.get(uid) is not None:
         target = ADMIN_AWAIT_BALANCE_SINGLE.pop(uid)
-        if not is_admin(uid): bot.reply_to(m, "Nicht erlaubt."); return
+        if not is_admin(uid):
+            bot.reply_to(m, "Nicht erlaubt.")
+            return
         try:
             txt = text.replace(" ", "")
             if txt.endswith("%"):
                 pct = float(txt[:-1].replace(",", "."))
                 old = get_balance_lamports(target)
-                new = int(round(old * (1 + pct/100.0)))
+                new = int(round(old * (1 + pct / 100.0)))
                 set_balance(target, new)
                 log_tx(target, "ADJ", new - old, meta=f"admin {pct:+.2f}%")
                 bot.reply_to(m, f"✅ UID {target}: {fmt_sol_usdc(old)} → {fmt_sol_usdc(new)} ({pct:+.2f}%)")
@@ -1540,82 +1505,122 @@ if AWAITING_PIN.get(uid):
                 log_tx(target, "ADJ", lam - old, meta="admin set")
                 bot.reply_to(m, f"✅ Guthaben gesetzt: UID {target} {fmt_sol_usdc(lam)}")
         except Exception:
-            bot.reply_to(m, "Bitte Zahl (z. B. 0.25) oder Prozent (z. B. -40%) senden.")
+            bot.reply_to(m, "Bitte Zahl (z. B. `0.25`) oder Prozent (z. B. `-40%`) senden.")
         return
+
     # Admin: balance edit global / mass ops / promo / pnl
     if ADMIN_AWAIT_BALANCE_GLOBAL.get(uid, False) or ADMIN_AWAIT_MASS_BALANCE.get(uid, False):
         is_mass = ADMIN_AWAIT_MASS_BALANCE.get(uid, False)
         ADMIN_AWAIT_BALANCE_GLOBAL[uid] = False
         ADMIN_AWAIT_MASS_BALANCE[uid] = False
-        if not is_admin(uid): bot.reply_to(m, "Nicht erlaubt."); return
+        if not is_admin(uid):
+            bot.reply_to(m, "Nicht erlaubt.")
+            return
         cmd = text.strip()
         try:
             if cmd.upper().startswith("ALL"):
                 parts = cmd.split()
                 if len(parts) != 2 or not parts[1].endswith("%"):
-                    bot.reply_to(m, "Format: ALL -40% / ALL +25%"); return
+                    bot.reply_to(m, "Format: `ALL -40%` / `ALL +25%`")
+                    return
                 pct = float(parts[1][:-1].replace(",", "."))
-                ids = all_users(); changed = 0
+                ids = all_users()
+                changed = 0
                 for uid_t in ids:
                     old = get_balance_lamports(uid_t)
-                    new = int(round(old * (1 + pct/100.0)))
-                    set_balance(uid_t, new); log_tx(uid_t, "ADJ", new - old, meta=f"mass {pct:+.2f}%")
+                    new = int(round(old * (1 + pct / 100.0)))
+                    set_balance(uid_t, new)
+                    log_tx(uid_t, "ADJ", new - old, meta=f"mass {pct:+.2f}%")
                     changed += 1
-                bot.reply_to(m, f"✅ Massenänderung: {changed} Nutzer ({pct:+.2f}%)."); return
+                bot.reply_to(m, f"✅ Massenänderung: {changed} Nutzer ({pct:+.2f}%).")
+                return
 
-            toks = cmd.split(); verb = toks[0].upper()
+            toks = cmd.split()
+            verb = toks[0].upper()
             if verb == "PROMO":
-                typ = toks[1].upper(); val = float(toks[2]); scope = toks[3].upper() if len(toks) > 3 else "ALL"
+                typ = toks[1].upper()
+                val = float(toks[2])
+                scope = toks[3].upper() if len(toks) > 3 else "ALL"
                 with get_db() as con:
-                    if scope == "ALL": rows = con.execute("SELECT user_id FROM users").fetchall()
-                    elif scope == "SUBSCRIBERS": rows = con.execute("SELECT user_id FROM users WHERE sub_active=1").fetchall()
-                    else: rows = []
+                    if scope == "ALL":
+                        rows = con.execute("SELECT user_id FROM users").fetchall()
+                    elif scope == "SUBSCRIBERS":
+                        rows = con.execute("SELECT user_id FROM users WHERE sub_active=1").fetchall()
+                    else:
+                        rows = []
                 affected = 0
                 for r in rows:
                     uid_t = int(r["user_id"])
                     if typ == "PERCENT":
                         bal = get_balance_lamports(uid_t)
                         delta = int(bal * (val / 100.0))
-                        add_balance(uid_t, delta); log_tx(uid_t, "ADJ", delta, meta=f"promo {val:.2f}%")
+                        add_balance(uid_t, delta)
+                        log_tx(uid_t, "ADJ", delta, meta=f"promo {val:.2f}%")
                     else:
                         lam = int(val * LAMPORTS_PER_SOL)
-                        add_balance(uid_t, lam); log_tx(uid_t, "ADJ", lam, meta=f"promo {val} SOL")
+                        add_balance(uid_t, lam)
+                        log_tx(uid_t, "ADJ", lam, meta=f"promo {val} SOL")
                     affected += 1
-                bot.reply_to(m, f"✅ PROMO auf {affected} Nutzer."); return
+                bot.reply_to(m, f"✅ PROMO auf {affected} Nutzer.")
+                return
+
             if verb == "PNL":
-                call_id = int(toks[1]); percent = float(toks[2]); affected = 0
+                call_id = int(toks[1])
+                percent = float(toks[2])
+                affected = 0
                 with get_db() as con:
-                    execs = con.execute("SELECT user_id, stake_lamports FROM executions WHERE call_id=? AND status IN ('FILLED','QUEUED')", (call_id,)).fetchall()
+                    execs = con.execute(
+                        "SELECT user_id, stake_lamports FROM executions WHERE call_id=? AND status IN ('FILLED','QUEUED')",
+                        (call_id,)
+                    ).fetchall()
                 for ex in execs:
-                    uid_t = int(ex["user_id"]); stake = int(ex["stake_lamports"] or 0)
-                    u = get_user(uid_t); risk = (u["auto_risk"] or "MEDIUM")
+                    uid_t = int(ex["user_id"])
+                    stake = int(ex["stake_lamports"] or 0)
+                    u2 = get_user(uid_t)
+                    risk = (rget(u2, "auto_risk", "MEDIUM") or "MEDIUM")
                     frac = _risk_fraction(risk)
                     pnl_lam = int(stake * (percent / 100.0) * frac)
-                    add_balance(uid_t, pnl_lam); log_tx(uid_t, "PNL", pnl_lam, ref_id=str(call_id), meta=f"{percent:+.2f}% * {frac:.2f}")
+                    add_balance(uid_t, pnl_lam)
+                    log_tx(uid_t, "PNL", pnl_lam, ref_id=str(call_id), meta=f"{percent:+.2f}% * {frac:.2f}")
                     affected += 1
-                bot.reply_to(m, f"✅ PNL (Call {call_id}) auf {affected} Nutzer."); return
+                bot.reply_to(m, f"✅ PNL (Call {call_id}) auf {affected} Nutzer.")
+                return
+
+            # Einzel-Target: UID/Username
             toks = cmd.split()
             if len(toks) < 2:
-                bot.reply_to(m, "Format: UID 12345 0.25 oder @username -40%"); return
-            target_id: Optional[int] = None; value_token: Optional[str] = None
+                bot.reply_to(m, "Format: `UID 12345 0.25` oder `@username -40%`", parse_mode="Markdown")
+                return
+            target_id = None
+            value_token = None
             if toks[0].upper() == "UID":
-                if len(toks) < 3: bot.reply_to(m, "Format: UID 12345 0.25"); return
-                try: target_id = int(toks[1])
-                except: bot.reply_to(m, "Ungültige UID."); return
+                if len(toks) < 3:
+                    bot.reply_to(m, "Format: `UID 12345 0.25`", parse_mode="Markdown")
+                    return
+                try:
+                    target_id = int(toks[1])
+                except Exception:
+                    bot.reply_to(m, "Ungültige UID.", parse_mode="Markdown")
+                    return
                 value_token = toks[2]
             elif toks[0].startswith("@"):
                 username = toks[0][1:]
                 with get_db() as con:
                     r = con.execute("SELECT user_id FROM users WHERE username=?", (username,)).fetchone()
-                if not r: bot.reply_to(m, "User nicht gefunden."); return
-                target_id = int(r["user_id"]); value_token = toks[1]
+                if not r:
+                    bot.reply_to(m, "User nicht gefunden.", parse_mode="Markdown")
+                    return
+                target_id = int(r["user_id"])
+                value_token = toks[1]
             else:
-                bot.reply_to(m, "Zuerst UID <id> oder @username angeben."); return
+                bot.reply_to(m, "`UID <id>` oder `@username` zuerst.", parse_mode="Markdown")
+                return
+
             t = value_token.replace(" ", "")
             if t.endswith("%"):
                 pct = float(t[:-1].replace(",", "."))
                 old = get_balance_lamports(target_id)
-                new = int(round(old * (1 + pct/100.0)))
+                new = int(round(old * (1 + pct / 100.0)))
                 set_balance(target_id, new)
                 log_tx(target_id, "ADJ", new - old, meta=f"admin {pct:+.2f}%")
                 bot.reply_to(m, f"✅ UID {target_id}: {fmt_sol_usdc(old)} → {fmt_sol_usdc(new)} ({pct:+.2f}%)")
@@ -1629,11 +1634,14 @@ if AWAITING_PIN.get(uid):
         except Exception as e:
             bot.reply_to(m, f"Fehler: {e}")
         return
+
     # Admin: Broadcast to ALL
     if ADMIN_AWAIT_NEWS_BROADCAST.get(uid):
         ctx = ADMIN_AWAIT_NEWS_BROADCAST.pop(uid, None)
         if ctx and ctx.get("step") == "await_text_to_all":
-            msg = text; ids = all_users(); sent = 0
+            msg = text
+            ids = all_users()
+            sent = 0
             for t in ids:
                 try:
                     if m.photo:
@@ -1641,33 +1649,41 @@ if AWAITING_PIN.get(uid):
                     else:
                         bot.send_message(t, msg, parse_mode="Markdown")
                     sent += 1
-                except Exception: pass
-            bot.reply_to(m, f"✅ Broadcast an {sent} Nutzer gesendet."); return
+                except Exception:
+                    pass
+            bot.reply_to(m, f"✅ Broadcast an {sent} Nutzer gesendet.")
+            return
+
     # Withdraw amount entry
     if WAITING_WITHDRAW_AMOUNT.get(uid) is None:
         if is_probably_solana_address(text):
             u = get_user(uid)
-                if u and rget(u, "pin_hash"):
+            if u and rget(u, "pin_hash"):
                 AWAITING_PIN[uid] = {"for": "setwallet", "next": ("PAY", text)}
-                bot.reply_to(m, "🔐 Bitte PIN senden, um Payout-Wallet zu ändern."); return
+                bot.reply_to(m, "🔐 Bitte PIN senden, um Payout-Wallet zu ändern.")
+                return
             set_payout_wallet(uid, text)
-            bot.reply_to(m, f"✅ Payout aktualisiert: `{md_escape(text)}`\nGib nun den Betrag in SOL ein (z. B. 0.25).", parse_mode="Markdown"); return
+            bot.reply_to(m, f"✅ Payout aktualisiert: `{md_escape(text)}`\nGib nun den Betrag in SOL ein (z. B. 0.25).", parse_mode="Markdown")
+            return
         try:
             sol = float(text.replace(",", "."))
-            if sol <= 0: bot.reply_to(m, "Betrag muss > 0 sein."); return
+            if sol <= 0:
+                bot.reply_to(m, "Betrag muss > 0 sein.")
+                return
             lam = int(sol * LAMPORTS_PER_SOL)
             if get_balance_lamports(uid) < lam:
                 bot.reply_to(m, f"Unzureichendes Guthaben. Verfügbar: {fmt_sol_usdc(get_balance_lamports(uid))}")
-                WAITING_WITHDRAW_AMOUNT.pop(uid, None); return
+                WAITING_WITHDRAW_AMOUNT.pop(uid, None)
+                return
             WAITING_WITHDRAW_AMOUNT[uid] = lam
             bot.reply_to(m, f"Auszahlung: {fmt_sol_usdc(lam)} — Wähle Lockup & Fee:", reply_markup=kb_withdraw_options())
+            return
         except Exception:
-            bot.reply_to(m, "Bitte eine gültige Zahl eingeben, z. B. 0.25.")
-        return
+            bot.reply_to(m, "Bitte eine gültige Zahl eingeben, z. B. `0.25`.")
+            return
 
     # Default
     bot.reply_to(m, "Ich habe das nicht verstanden. Nutze das Menü.", reply_markup=kb_main(get_user(uid)))
-
 # ---------------------------
 # Background loops
 # ---------------------------
