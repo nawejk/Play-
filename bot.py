@@ -7,6 +7,7 @@ import random
 import threading
 import sqlite3
 import hashlib
+import re
 from contextlib import contextmanager
 from typing import Optional, Dict, List
 
@@ -45,6 +46,7 @@ DB_PATH = os.getenv("DB_PATH", "memebot_full.db")
 LAMPORTS_PER_SOL = 1_000_000_000
 MIN_SUB_SOL = float(os.getenv("MIN_SUB_SOL", "0.1"))
 
+# Internes Flag – KEIN User-facing Output darüber!
 SIMULATION_MODE = True
 
 # ---------------------------
@@ -97,17 +99,11 @@ def is_probably_solana_address(addr: str) -> bool:
         return False
     allowed = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
     return all(ch in allowed for ch in addr)
-    
-import re
 
 _BASE58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 _BASE58_RE = re.compile(rf"[{_BASE58}]{{32,44}}")
 
 def extract_solana_address(text: str) -> Optional[str]:
-    """
-    Gibt die erste base58-ähnliche Zeichenkette (32–44 Länge) zurück,
-    die wie eine Solana-Adresse aussieht – oder None.
-    """
     if not text:
         return None
     m = _BASE58_RE.search(text)
@@ -115,15 +111,13 @@ def extract_solana_address(text: str) -> Optional[str]:
         return None
     candidate = m.group(0)
     return candidate if is_probably_solana_address(candidate) else None
-    
+
 def gen_referral_for_user(user_id: int) -> str:
     h = hashlib.sha1(str(user_id).encode()).hexdigest()[:8]
     return f"REF{h.upper()}"
+
 def rget(row, key, default=None):
-    """
-    Sicherer Getter für sqlite3.Row und dicts.
-    Liefert default, wenn Key fehlt oder Wert None ist.
-    """
+    """Sicherer Getter für sqlite3.Row und dicts."""
     if row is None:
         return default
     try:
@@ -131,6 +125,7 @@ def rget(row, key, default=None):
         return v if v is not None else default
     except Exception:
         return default
+
 # ---------------------------
 # DB schema & helpers
 # ---------------------------
@@ -264,6 +259,10 @@ def all_subscribers() -> List[int]:
     with get_db() as con:
         return [r["user_id"] for r in con.execute("SELECT user_id FROM users WHERE sub_active=1").fetchall()]
 
+def all_auto_on_users() -> List[int]:
+    with get_db() as con:
+        return [r["user_id"] for r in con.execute("SELECT user_id FROM users WHERE UPPER(COALESCE(auto_mode,'OFF'))='ON'").fetchall()]
+
 def add_balance(user_id: int, lamports: int):
     with get_db() as con:
         con.execute("UPDATE users SET sol_balance_lamports = sol_balance_lamports + ? WHERE user_id=?", (lamports, user_id))
@@ -371,10 +370,9 @@ def queue_execution(call_id: int, user_id: int, status: str = "QUEUED", message:
         return cur.lastrowid
 
 def fmt_call(c) -> str:
-    # funktioniert für sqlite3.Row und dict
     market_type = rget(c, "market_type", "")
     base = rget(c, "base", "")
-    if market_type == "FUTURES":
+    if (market_type or "").upper() == "FUTURES":
         side = rget(c, "side", "")
         lev = rget(c, "leverage", "")
         core = f"Futures • {base} • {side} {lev}".strip()
@@ -382,7 +380,7 @@ def fmt_call(c) -> str:
         core = f"MEME • {base}"
     token_addr = rget(c, "token_address", "")
     notes = rget(c, "notes", "")
-    extra = f"\nToken: `{md_escape(token_addr)}`" if (market_type == "MEME" and token_addr) else ""
+    extra = f"\nToken: `{md_escape(token_addr)}`" if ((market_type or "").upper() == "MEME" and token_addr) else ""
     note = f"\nNotes: {md_escape(notes)}" if notes else ""
     return f"🧩 *{core}*{extra}{note}"
 
@@ -390,27 +388,22 @@ def fmt_call(c) -> str:
 # Keyboards
 # ---------------------------
 def kb_main(u):
-    # Variante 3: geordnete Buttons (deine Anordnung)
     bal = fmt_sol_usdc(int(u["sol_balance_lamports"] or 0))
     auto_mode = (u["auto_mode"] or "OFF").upper()
     auto_risk = (u["auto_risk"] or "MEDIUM").upper()
     kb = InlineKeyboardMarkup()
-    # Obere Zeilen
     kb.add(InlineKeyboardButton("💳 Auszahlung", callback_data="withdraw"),
            InlineKeyboardButton("📈 Portfolio", callback_data="my_portfolio"))
     kb.add(InlineKeyboardButton("💸 Einzahlen", callback_data="deposit"),
            InlineKeyboardButton("🤖 Auto-Entry", callback_data="auto_menu"))
     kb.add(InlineKeyboardButton("📜 Verlauf", callback_data="history"),
            InlineKeyboardButton("🆘 Support", callback_data="open_support"))
-    # Weitere Funktionen
     kb.add(InlineKeyboardButton("🔔 Signale", callback_data="sub_menu"),
            InlineKeyboardButton("🔗 Referral", callback_data="referral"))
     kb.add(InlineKeyboardButton("ℹ️ Hinweis", callback_data="hint"),
            InlineKeyboardButton("⚖️ Rechtliches", callback_data="legal"))
-    # Admin
     if is_admin(int(u["user_id"])):
         kb.add(InlineKeyboardButton("🛠️ Admin (Kontrolle)", callback_data="admin_menu_big"))
-    # Status-Zeile
     kb.add(InlineKeyboardButton(f"🏦 Guthaben: {bal}", callback_data="noop"))
     kb.add(InlineKeyboardButton(f"🤖 Auto: {auto_mode} • Risiko: {auto_risk}", callback_data="noop"))
     return kb
@@ -426,7 +419,7 @@ def kb_auto_menu(u):
     mode = (u["auto_mode"] or "OFF").upper()
     risk = (u["auto_risk"] or "MEDIUM").upper()
     kb = InlineKeyboardMarkup()
-    on_off = "🔴 Auto AUS" if mode == "ON" else "🟢 Auto EIN"
+    on_off = "🔴 Auto AUS" if mode == "OFF" else "🟢 Auto EIN"
     kb.add(InlineKeyboardButton(on_off, callback_data="auto_toggle"))
     kb.add(InlineKeyboardButton(("✅ " if risk=="LOW" else "") + "LOW", callback_data="auto_risk_LOW"),
            InlineKeyboardButton(("✅ " if risk=="MEDIUM" else "") + "MEDIUM", callback_data="auto_risk_MEDIUM"),
@@ -447,8 +440,7 @@ def kb_admin_main():
     kb.add(InlineKeyboardButton("🔧 Promotions / PnL", callback_data="admin_apply_pnl"))
     kb.add(InlineKeyboardButton("⬅️ Zurück", callback_data="back_home"))
     return kb
-
-def kb_users_pagination(offset: int, total: int, prefix: str = "admin_view_users", page_size: int = 25):
+    def kb_users_pagination(offset: int, total: int, prefix: str = "admin_view_users", page_size: int = 25):
     kb = InlineKeyboardMarkup()
     prev_off = max(0, offset - page_size)
     next_off = offset + page_size if offset + page_size < total else offset
@@ -647,7 +639,7 @@ class CentralWatcher:
             _apply_referral_deposit(uid, amount)
 
 # ---------------------------
-# Simulated trading
+# Simulated trading (keine User-facing „Simulation“-Texte)
 # ---------------------------
 def dex_market_buy_simulated(user_id: int, base: str, amount_lamports: int):
     return {"status": "FILLED", "txid": f"Live-DEX-{base}-{int(time.time())}", "spent_lamports": amount_lamports}
@@ -659,10 +651,8 @@ def futures_place_simulated(user_id: int, base: str, side: str, leverage: str, r
 # Bot init & safe send wrappers
 # ---------------------------
 init_db()
-# WICHTIG: Default OHNE Markdown, damit keine Entity-Fehler!
-bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)
+bot = telebot.TeleBot(BOT_TOKEN, parse_mode=None)  # Default: None – wir setzen Markdown nur gezielt
 
-# Safe send wrappers
 _original_send_message = bot.send_message
 def _safe_send_message(chat_id, text, **kwargs):
     try:
@@ -675,7 +665,6 @@ def _safe_send_message(chat_id, text, **kwargs):
                 return _original_send_message(chat_id, md_escape(str(text)), **kwargs2)
             except Exception:
                 kwargs3 = dict(kwargs2); kwargs3.pop("parse_mode", None)
-                # fällt zurück auf plain text
                 return _original_send_message(chat_id, str(text), **kwargs3)
         else:
             kwargs3 = dict(kwargs); kwargs3.pop("parse_mode", None)
@@ -700,15 +689,14 @@ def _safe_edit_message_text(text, chat_id, message_id, **kwargs):
             return _original_edit_message_text(str(text), chat_id, message_id, **kwargs3)
 bot.edit_message_text = _safe_edit_message_text
 
-# Safe answer_callback_query (verhindert 400: query too old)
 _original_answer_callback_query = bot.answer_callback_query
 def _safe_answer_callback_query(callback_query_id, *args, **kwargs):
     try:
         return _original_answer_callback_query(callback_query_id, *args, **kwargs)
     except _apihelper.ApiTelegramException:
-        # Ignorieren – passiert z. B. nach Bot-Restart bei alten Query-IDs
         return None
 bot.answer_callback_query = _safe_answer_callback_query
+
 # ---------------------------
 # States
 # ---------------------------
@@ -817,7 +805,6 @@ HINT_TEXT = (
 )
 
 def home_text(u) -> str:
-    # KEIN Markdown nötig; wir zeigen alles plain, um Entity-Fehler zu vermeiden
     raw_uname = ("@" + (u["username"] or "")) if u["username"] else f"ID {u['user_id']}"
     bal = fmt_sol_usdc(int(u["sol_balance_lamports"] or 0))
     code = _ensure_user_refcode(int(u["user_id"]))
@@ -837,7 +824,9 @@ def home_text(u) -> str:
 
 def _hash_pin(pin: str) -> str:
     return hashlib.sha256(("PIN|" + pin).encode()).hexdigest()
-
+    # ---------------------------
+# Commands
+# ---------------------------
 @bot.message_handler(commands=["setpin"])
 def cmd_setpin(m: Message):
     uid = m.from_user.id
@@ -862,6 +851,9 @@ def cmd_support(m: Message):
 @bot.message_handler(commands=["auto"])
 def cmd_auto(m: Message):
     u = get_user(m.from_user.id)
+    if not u:
+        upsert_user(m.from_user.id, m.from_user.username or "", 1 if is_admin(m.from_user.id) else 0)
+        u = get_user(m.from_user.id)
     bot.reply_to(m,
                  f"🤖 Auto-Entry\nStatus: {(u['auto_mode'] or 'OFF').upper()} • Risiko: {(u['auto_risk'] or 'MEDIUM').upper()}",
                  reply_markup=kb_auto_menu(u))
@@ -880,6 +872,34 @@ def _on_verified_deposit(evt: dict):
 
 watcher.on_verified_deposit = _on_verified_deposit
 threading.Thread(target=watcher.start, kwargs={"interval_sec": 40}, daemon=True).start()
+
+# ---------------------------
+# Helper: Auto-Entry Join Message
+# ---------------------------
+def _auto_entry_message(u_row, call_row, status_str: str, stake_lamports: int, txid_hint: str = "") -> str:
+    risk = (rget(u_row, "auto_risk", "MEDIUM") or "MEDIUM").upper()
+    mt = (rget(call_row, "market_type", "FUTURES") or "FUTURES").upper()
+    if mt == "FUTURES":
+        base = rget(call_row, "base", "")
+        side = rget(call_row, "side", "")
+        lev  = rget(call_row, "leverage", "")
+        line2 = f"🧩 Futures • {base} • {side} {lev}"
+    else:
+        base = rget(call_row, "base", "")
+        line2 = f"🧩 Spot • {base}"
+    bal_now = get_balance_lamports(int(u_row["user_id"]))
+    lines = [
+        f"🤖 Auto-Entry • {risk}",
+        line2,
+        f"Status: {status_str}",
+        "Auto-Trading ist für diesen Call aktiviert.",
+        f"Einsatz (Info): {fmt_sol_usdc(stake_lamports)}",
+        f"Guthaben bleibt unverändert: {fmt_sol_usdc(bal_now)}",
+        "Live-ORDER"
+    ]
+    if txid_hint:
+        lines.append(f"`{md_escape(txid_hint)}`")
+    return "\n".join(lines)
 
 # ---------------------------
 # Handlers
@@ -908,7 +928,6 @@ def cmd_start(m: Message):
             _set_ref_by(uid, referrer)
 
     u = get_user(uid)
-    # WICHTIG: parse_mode NICHT setzen (Bot default ist None)
     bot.reply_to(m, home_text(u), reply_markup=kb_main(u))
 
 @bot.callback_query_handler(func=lambda c: True)
@@ -1068,17 +1087,33 @@ def on_cb(c: CallbackQuery):
             row = con.execute("SELECT * FROM calls ORDER BY id DESC LIMIT 1").fetchone()
         if not row:
             bot.answer_callback_query(c.id, "Kein Call vorhanden."); return
+
+        # 1) Info an Abonnenten (reiner Call-Text)
         msg = "📣 Neuer Call:\n" + fmt_call(row)
         subs = all_subscribers()
-        sent = 0
+        sent_announce = 0
         for su in subs:
             try:
                 bot.send_message(su, msg, parse_mode="Markdown")
-                queue_execution(int(row["id"]), su, status="QUEUED", message="Queued by broadcast")
-                sent += 1
+                sent_announce += 1
             except Exception:
                 pass
-        bot.answer_callback_query(c.id, f"An {sent} Abonnenten gesendet."); return
+
+        # 2) Auto-Entry: alle mit Auto=ON bekommen JOINED & Execution wird gequeued
+        auto_users = all_auto_on_users()
+        joined = 0
+        for au in auto_users:
+            try:
+                queue_execution(int(row["id"]), au, status="QUEUED", message="Queued by broadcast")
+                urow = get_user(au)
+                stake = _compute_stake_for_user(au)
+                bot.send_message(au, _auto_entry_message(urow, row, "JOINED", stake), parse_mode="Markdown")
+                joined += 1
+            except Exception:
+                pass
+
+        bot.answer_callback_query(c.id, f"📣 Ankündigungen: {sent_announce} • Auto-Entry JOINED: {joined}")
+        return
 
     if data == "admin_investors_menu":
         if not is_admin(uid): return
@@ -1635,7 +1670,7 @@ def catch_all(m: Message):
             bot.reply_to(m, f"Fehler: {e}")
         return
 
-    # Admin: Broadcast to ALL
+    # Admin: Broadcast to ALL (freie Nachricht)
     if ADMIN_AWAIT_NEWS_BROADCAST.get(uid):
         ctx = ADMIN_AWAIT_NEWS_BROADCAST.pop(uid, None)
         if ctx and ctx.get("step") == "await_text_to_all":
@@ -1662,9 +1697,6 @@ def catch_all(m: Message):
                 AWAITING_PIN[uid] = {"for": "setwallet", "next": ("PAY", text)}
                 bot.reply_to(m, "🔐 Bitte PIN senden, um Payout-Wallet zu ändern.")
                 return
-            set_payout_wallet(uid, text)
-            bot.reply_to(m, f"✅ Payout aktualisiert: `{md_escape(text)}`\nGib nun den Betrag in SOL ein (z. B. 0.25).", parse_mode="Markdown")
-            return
         try:
             sol = float(text.replace(",", "."))
             if sol <= 0:
@@ -1679,11 +1711,12 @@ def catch_all(m: Message):
             bot.reply_to(m, f"Auszahlung: {fmt_sol_usdc(lam)} — Wähle Lockup & Fee:", reply_markup=kb_withdraw_options())
             return
         except Exception:
-            bot.reply_to(m, "Bitte eine gültige Zahl eingeben, z. B. `0.25`.")
-            return
+            # Wenn es keine gültige Zahl ist, ignoriere – fällt unten in Default
+            pass
 
     # Default
     bot.reply_to(m, "Ich habe das nicht verstanden. Nutze das Menü.", reply_markup=kb_main(get_user(uid)))
+
 # ---------------------------
 # Background loops
 # ---------------------------
@@ -1699,30 +1732,28 @@ def auto_executor_loop():
                     LIMIT 200
                 """).fetchall()
             for r in rows:
-                if (r["auto_mode"] or "OFF") != "ON":
+                if (r["auto_mode"] or "OFF").upper() != "ON":
                     with get_db() as con:
                         con.execute("UPDATE executions SET status='ERROR', message='Auto OFF' WHERE id=?", (r["eid"],))
                     continue
                 call = get_call(int(r["call_id"]))
-                stake_info = int(r["stake_lamports"] or _compute_stake_for_user(int(r["user_id"])))
+                stake = int(r["stake_lamports"] or _compute_stake_for_user(int(r["user_id"])))
+                # Place order (no user-facing "simulation")
                 if SIMULATION_MODE:
-                    if call["market_type"] == "FUTURES":
-                        result = futures_place_simulated(int(r["user_id"]), call["base"], (call.get("side") or ""), (call.get("leverage") or ""), (r["auto_risk"] or "MEDIUM"))
+                    if (rget(call, "market_type","FUTURES") or "FUTURES").upper() == "FUTURES":
+                        result = futures_place_simulated(int(r["user_id"]), rget(call,"base",""), rget(call,"side",""), rget(call,"leverage",""), (r["auto_risk"] or "MEDIUM"))
                     else:
-                        result = dex_market_buy_simulated(int(r["user_id"]), call["base"], stake_info)
+                        result = dex_market_buy_simulated(int(r["user_id"]), rget(call,"base",""), stake)
                 else:
-                    result = {"status": "FILLED", "txid": "LIVE-TX-REPLACE"}
+                    result = {"status": "FILLED", "txid": f"LIVE-{int(time.time())}"}
                 status = result.get("status") or "FILLED"
                 txid = result.get("txid") or result.get("order_id") or ""
                 with get_db() as con:
                     con.execute("UPDATE executions SET status=?, txid=?, message=? WHERE id=?", (status, txid, "JOINED", r["eid"]))
                 try:
+                    urow = get_user(int(r["user_id"]))
                     bot.send_message(int(r["user_id"]),
-                                     f"🤖 Auto-Entry • {(r['auto_risk'] or 'MEDIUM')}\n"
-                                     f"{fmt_call(call)}\n"
-                                     f"Status: *{status}*\n"
-                                     f"Einsatz (Info): {fmt_sol_usdc(stake_info)}\n"
-                                     f"`{md_escape(txid)}`",
+                                     _auto_entry_message(urow, call, "JOINED", stake, txid),
                                      parse_mode="Markdown")
                 except Exception:
                     pass
@@ -1755,5 +1786,5 @@ def payout_reminder_loop():
 threading.Thread(target=auto_executor_loop, daemon=True).start()
 threading.Thread(target=payout_reminder_loop, daemon=True).start()
 
-print("Bot läuft — enhanced. SIMULATION_MODE =", SIMULATION_MODE)
+print("Bot läuft — enhanced.")
 bot.infinity_polling(timeout=60, long_polling_timeout=60)
