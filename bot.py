@@ -1083,10 +1083,10 @@ def on_cb(c: CallbackQuery):
 
     if data == "admin_broadcast_last":
        if not is_admin(uid): return
-    with get_db() as con:
-        row = con.execute("SELECT * FROM calls ORDER BY id DESC LIMIT 1").fetchone()
-    if not row:
-        bot.answer_callback_query(c.id, "Kein Call vorhanden."); return
+       with get_db() as con:
+           row = con.execute("SELECT * FROM calls ORDER BY id DESC LIMIT 1").fetchone()
+       if not row:
+           bot.answer_callback_query(c.id, "Kein Call vorhanden."); return
 
     msg = "📣 Neuer Call:\n" + fmt_call(row)
     subs = all_subscribers()
