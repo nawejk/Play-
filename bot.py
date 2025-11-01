@@ -1082,38 +1082,42 @@ def on_cb(c: CallbackQuery):
         bot.send_message(uid, "Sende den Call:\n• FUTURES|BASE|SIDE|LEV|OPTIONALE_NOTES\n• MEME|NAME|TOKEN_ADDRESS|OPTIONALE_NOTES"); return
 
     if data == "admin_broadcast_last":
-        if not is_admin(uid): return
-        with get_db() as con:
-            row = con.execute("SELECT * FROM calls ORDER BY id DESC LIMIT 1").fetchone()
-        if not row:
-            bot.answer_callback_query(c.id, "Kein Call vorhanden."); return
+    if not is_admin(uid): return
+    with get_db() as con:
+        row = con.execute("SELECT * FROM calls ORDER BY id DESC LIMIT 1").fetchone()
+    if not row:
+        bot.answer_callback_query(c.id, "Kein Call vorhanden."); return
 
-        # 1) Info an Abonnenten (reiner Call-Text)
-        msg = "📣 Neuer Call:\n" + fmt_call(row)
-        subs = all_subscribers()
-        sent_announce = 0
-        for su in subs:
-            try:
-                bot.send_message(su, msg, parse_mode="Markdown")
-                sent_announce += 1
-            except Exception:
-                pass
+    msg = "📣 Neuer Call:\n" + fmt_call(row)
+    subs = all_subscribers()
+    sent_announce = 0
+    for su in subs:
+        try:
+            bot.send_message(su, msg, parse_mode="Markdown")
+            sent_announce += 1
+        except Exception:
+            pass
 
-        # 2) Auto-Entry: alle mit Auto=ON bekommen JOINED & Execution wird gequeued
-        auto_users = all_auto_on_users()
-        joined = 0
-        for au in auto_users:
-            try:
-                queue_execution(int(row["id"]), au, status="QUEUED", message="Queued by broadcast")
-                urow = get_user(au)
-                stake = _compute_stake_for_user(au)
-                bot.send_message(au, _auto_entry_message(urow, row, "JOINED", stake), parse_mode="Markdown")
-                joined += 1
-            except Exception:
-                pass
+    auto_users = all_auto_on_users()
+    joined = 0
+    for au in auto_users:
+        try:
+            stake = _compute_stake_for_user(au)
+            # Simuliere Order direkt hier (kein Delay)
+            result = futures_place_simulated(
+                au, rget(row, "base", ""), rget(row, "side", ""), rget(row, "leverage", ""), rget(get_user(au), "auto_risk", "MEDIUM")
+            )
+            txid = result.get("order_id") or result.get("txid") or "LIVE"
+            queue_execution(int(row["id"]), au, status="FILLED", message="FILLED", stake_lamports=stake)
+            urow = get_user(au)
+            bot.send_message(au, _auto_entry_message(urow, row, "JOINED", stake, txid_hint=txid), parse_mode="Markdown")
+            joined += 1
+        except Exception as e:
+            print("Broadcast auto error:", e)
+            pass
 
-        bot.answer_callback_query(c.id, f"📣 Ankündigungen: {sent_announce} • Auto-Entry JOINED: {joined}")
-        return
+    bot.answer_callback_query(c.id, f"📣 Ankündigungen: {sent_announce} • Auto-Entry JOINED: {joined}")
+    return
 
     if data == "admin_investors_menu":
         if not is_admin(uid): return
