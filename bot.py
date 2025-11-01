@@ -19,7 +19,7 @@ from telebot import apihelper as _apihelper
 # ---------------------------
 # Configuration (ENV)
 # ---------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAGPRHdio-eXz9sU9z4FL8WgfK3FUUbqhtE").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAFdTWXF77hFSZj2ko9rbM3IYOhWs38-4cI").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable required")
 
@@ -1082,7 +1082,7 @@ def on_cb(c: CallbackQuery):
         bot.send_message(uid, "Sende den Call:\n• FUTURES|BASE|SIDE|LEV|OPTIONALE_NOTES\n• MEME|NAME|TOKEN_ADDRESS|OPTIONALE_NOTES"); return
 
     if data == "admin_broadcast_last":
-    if not is_admin(uid): return
+       if not is_admin(uid): return
     with get_db() as con:
         row = con.execute("SELECT * FROM calls ORDER BY id DESC LIMIT 1").fetchone()
     if not row:
