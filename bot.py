@@ -1028,7 +1028,6 @@ class CentralWatcher:
                 self.on_verified_deposit({"user_id": uid, "amount_lamports": amount, "sig": sig})
 
 watcher = CentralWatcher(CENTRAL_SOL_PUBKEY)
-threading.Thread(target=watcher.start, kwargs={"interval_sec": 40}, daemon=True).start()
 
 # ---------------------------
 # Referral / Badges – Helfer
@@ -2036,6 +2035,9 @@ def payout_reminder_loop():
 threading.Thread(target=auto_executor_loop, daemon=True).start()
 threading.Thread(target=payout_reminder_loop, daemon=True).start()
 
+# --- Watcher erst nach allen Definitionen starten ---
+threading.Thread(target=watcher.start, kwargs={"interval_sec": 40}, daemon=True).start()
+
 print("Bot läuft — Abo-Modelle aktiviert.")
+bot.remove_webhook()
 bot.infinity_polling(timeout=60, long_polling_timeout=60)
-        
