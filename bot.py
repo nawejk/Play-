@@ -1806,8 +1806,7 @@ def catch_all(m: Message):
 # Zusätzliche Callback-Handler, die in Teil 2 referenziert werden
 # (Deposit/Withdraw/Referral/History/Admin Payout manage etc.)
 # ---------------------------
-@bot.callback_query_handler(func=lambda c: True)
-def on_cb_part3(c: CallbackQuery):
+def on_cb_part2(c: CallbackQuery):
     uid = c.from_user.id
     data = c.data or ""
     u = get_user(uid)
