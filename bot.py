@@ -1182,8 +1182,8 @@ def cmd_start(m: Message):
     u = get_user(uid)
     bot.reply_to(m, home_text(u), reply_markup=kb_main(u))
 
-@bot.callback_query_handler(func=lambda c: True)
-def on_cb_part2(c: CallbackQuery):
+@bot.callback_query_handler(func=lambda c: (c.data or "").startswith(("subs_", "admin_subs")))
+def on_cb_subs(c: CallbackQuery):
     uid = c.from_user.id
     data = c.data or ""
     u = get_user(uid)
