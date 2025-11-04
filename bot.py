@@ -19,7 +19,7 @@ from telebot import apihelper as _apihelper
 # ---------------------------
 # Configuration (ENV)
 # ---------------------------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAFQAGatNDY56bV5mmU_ZM15gg3mN1lOp7c").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAHIXbRa_B6tOcssQLOMHamrt8pfRg_hWCc").strip()
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable required")
 
