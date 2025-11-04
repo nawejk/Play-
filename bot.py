@@ -1866,7 +1866,7 @@ if data == "withdraw":
         uid,
         f"💳 Payout: `{md_escape(u['payout_wallet'])}`\nGib den Betrag in SOL ein (z. B. `0.25`).",
         parse_mode="Markdown"
-    )return
+    ) return
 
     if data.startswith("payoutopt_"):
         urow = get_user(uid)
