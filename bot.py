@@ -1182,35 +1182,35 @@ def cmd_start(m: Message):
     u = get_user(uid)
     bot.reply_to(m, home_text(u), reply_markup=kb_main(u))
 
-@bot.callback_query_handler(func=lambda c: (c.data or "").startswith(("subs_", "admin_subs")))
+@@bot.callback_query_handler(func=lambda c: (c.data or "").startswith(("subs_", "admin_subs")))
 def on_cb_subs(c: CallbackQuery):
     uid = c.from_user.id
     data = c.data or ""
     u = get_user(uid)
-# alle NICHT-Subs-Callbacks hierhin routen
-@bot.callback_query_handler(func=lambda c: not (c.data or "").startswith(("subs_", "admin_subs")))
-def on_cb_router(c: CallbackQuery):
-    on_cb_part2(c)
-    
+
     # --- Abo-Menü ---
     if data == "subs_menu":
         bot.answer_callback_query(c.id)
         bot.edit_message_text(subs_intro_text(), c.message.chat.id, c.message.message_id,
-                              parse_mode="Markdown", reply_markup=kb_subs_main()); return
+                              parse_mode="Markdown", reply_markup=kb_subs_main())
+        return
 
     if data == "subs_handbook":
         bot.answer_callback_query(c.id)
-        bot.send_message(uid, SUBS_HANDBOOK_TEXT, parse_mode="Markdown"); return
+        bot.send_message(uid, SUBS_HANDBOOK_TEXT, parse_mode="Markdown")
+        return
 
     if data == "subs_user_menu":
         bot.answer_callback_query(c.id)
-        bot.send_message(uid, explain_user_plan(), parse_mode="Markdown", reply_markup=kb_user_plans()); return
+        bot.send_message(uid, explain_user_plan(), parse_mode="Markdown", reply_markup=kb_user_plans())
+        return
 
     # Plan-Wahl
     if data.startswith("subs_choose_"):
         plan_code = data.split("_", 2)[2]
         if plan_code not in PLAN_DEFS:
-            bot.answer_callback_query(c.id, "Unbekannter Plan."); return
+            bot.answer_callback_query(c.id, "Unbekannter Plan.")
+            return
         bot.answer_callback_query(c.id, f"Plan: {plan_code}")
         if plan_code == "CREATOR":
             bot.send_message(uid, explain_creator(), parse_mode="Markdown")
@@ -1223,18 +1223,19 @@ def on_cb_router(c: CallbackQuery):
     if data.startswith("subs_sent_"):
         plan_code = data.split("_", 2)[2]
         if plan_code not in PLAN_DEFS:
-            bot.answer_callback_query(c.id, "Plan ungültig."); return
+            bot.answer_callback_query(c.id, "Plan ungültig.")
+            return
         exp = SUB_LAST_PRICE_LAMPORTS.get(uid)
         src = SUB_PENDING_SRC.get(uid)
         if not exp or not src:
-            bot.answer_callback_query(c.id, "Keine Zahlung erfasst. Sende zuerst deine Absender-Wallet."); return
+            bot.answer_callback_query(c.id, "Keine Zahlung erfasst. Sende zuerst deine Absender-Wallet.")
+            return
         bot.answer_callback_query(c.id, "Prüfe Zahlung …")
         res = verify_subscription_payment(uid, plan_code, exp, src)
         if not res:
             bot.send_message(uid, "❌ Noch keine passende Zahlung auf der Abo-Adresse gefunden. Bitte 1–2 Minuten später erneut drücken.")
             return
         sig, lam, sender = res
-        # Abo aktivieren
         complete_subscription(uid, plan_code, sig, sender)
         # Aufräumen
         SUB_SELECTED_PLAN.pop(uid, None)
@@ -1246,14 +1247,17 @@ def on_cb_router(c: CallbackQuery):
     # Admin: Subs
     if data == "admin_subs_menu":
         if not is_admin(uid):
-            bot.answer_callback_query(c.id, "Nicht erlaubt."); return
+            bot.answer_callback_query(c.id, "Nicht erlaubt.")
+            return
         bot.answer_callback_query(c.id)
         bot.edit_message_text("🧩 Abos verwalten", c.message.chat.id, c.message.message_id,
-                              reply_markup=kb_admin_subs_menu()); return
+                              reply_markup=kb_admin_subs_menu())
+        return
 
     if data.startswith("admin_subs_list_active_"):
         if not is_admin(uid):
-            bot.answer_callback_query(c.id, "Nicht erlaubt."); return
+            bot.answer_callback_query(c.id, "Nicht erlaubt.")
+            return
         try:
             offset = int(data.rsplit("_", 1)[1])
         except:
@@ -1291,7 +1295,8 @@ def on_cb_router(c: CallbackQuery):
 
     if data == "admin_subs_grant":
         if not is_admin(uid):
-            bot.answer_callback_query(c.id, "Nicht erlaubt."); return
+            bot.answer_callback_query(c.id, "Nicht erlaubt.")
+            return
         ADMIN_SUBS_GRANT_WAIT[uid] = True
         bot.answer_callback_query(c.id, "Abo gewähren")
         bot.send_message(uid, "Sende: `UID <id> <PLAN_CODE> [tage]` (tage optional; z.B. `UID 12345 BRONZE 14`)", parse_mode="Markdown")
@@ -1299,7 +1304,8 @@ def on_cb_router(c: CallbackQuery):
 
     if data == "admin_subs_remove":
         if not is_admin(uid):
-            bot.answer_callback_query(c.id, "Nicht erlaubt."); return
+            bot.answer_callback_query(c.id, "Nicht erlaubt.")
+            return
         ADMIN_SUBS_REMOVE_WAIT[uid] = True
         bot.answer_callback_query(c.id, "Abo entfernen")
         bot.send_message(uid, "Sende: `UID <id> [PLAN_CODE]` (PLAN_CODE optional, entfernt alle aktiven)", parse_mode="Markdown")
@@ -1307,11 +1313,18 @@ def on_cb_router(c: CallbackQuery):
 
     if data == "admin_subs_set_expiry":
         if not is_admin(uid):
-            bot.answer_callback_query(c.id, "Nicht erlaubt."); return
+            bot.answer_callback_query(c.id, "Nicht erlaubt.")
+            return
         ADMIN_SUBS_EXPIRY_WAIT[uid] = True
         bot.answer_callback_query(c.id, "Ablauf setzen")
         bot.send_message(uid, "Sende: `UID <id> <tage>` (setzt Ablauf ab jetzt)", parse_mode="Markdown")
         return
+
+
+# alle NICHT-Subs-Callbacks hierhin routen
+@bot.callback_query_handler(func=lambda c: not (c.data or "").startswith(("subs_", "admin_subs")))
+def on_cb_router(c: CallbackQuery):
+    on_cb_part2(c)
         # ---------------------------
 # Falls RPC-Helper noch nicht im File sind: bereitstellen
 # ---------------------------
@@ -1851,30 +1864,32 @@ def on_cb_part2(c: CallbackQuery):
         WAITING_SOURCE_WALLET[uid] = True
         return
 
-    # # withdraw
-if data == "withdraw":
-    if not u["payout_wallet"]:
-        WAITING_PAYOUT_WALLET[uid] = True
-        bot.answer_callback_query(c.id, "Bitte Payout-Adresse senden.")
-        bot.send_message(uid, "🔑 Sende deine Auszahlungsadresse (SOL):")
+     # withdraw  ✅ richtig eingerückt
+    if data == "withdraw":
+        if not u["payout_wallet"]:
+            WAITING_PAYOUT_WALLET[uid] = True
+            bot.answer_callback_query(c.id, "Bitte Payout-Adresse senden.")
+            bot.send_message(uid, "🔑 Sende deine Auszahlungsadresse (SOL):")
+            return
+
+        # Wallet existiert → Betrag abfragen
+        WAITING_PAYOUT_WALLET[uid] = False
+        WAITING_WITHDRAW_AMOUNT[uid] = None
+        bot.answer_callback_query(c.id, "Bitte Betrag eingeben.")
+        bot.send_message(
+            uid,
+            f"💳 Payout: `{md_escape(u['payout_wallet'])}`\nGib den Betrag in SOL ein (z. B. `0.25`).",
+            parse_mode="Markdown"
+        )
         return
-    # Wallet existiert bereits → jetzt Betrag abfragen, NICHT auf Wallet warten
-    WAITING_PAYOUT_WALLET[uid] = False
-    WAITING_WITHDRAW_AMOUNT[uid] = None
-    bot.answer_callback_query(c.id, "Bitte Betrag eingeben.")
-    bot.send_message(
-        uid,
-        f"💳 Payout: `{md_escape(u['payout_wallet'])}`\nGib den Betrag in SOL ein (z. B. `0.25`).",
-        parse_mode="Markdown"
-    ) 
-    return
 
     if data.startswith("payoutopt_"):
         urow = get_user(uid)
         if urow and urow.get("pin_hash"):
             AWAITING_PIN[uid] = {"for": "withdraw_option", "data": data}
             bot.answer_callback_query(c.id, "PIN erforderlich.")
-            bot.send_message(uid, "🔐 Bitte sende deine PIN, um fortzufahren."); return
+            bot.send_message(uid, "🔐 Bitte sende deine PIN, um fortzufahren.")
+            return
         return _do_payout_option(uid, c)
 
     # subscriptions (werden in Teil 2 behandelt) – hier nur Fallback
