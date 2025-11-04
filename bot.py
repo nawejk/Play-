@@ -1187,7 +1187,11 @@ def on_cb_subs(c: CallbackQuery):
     uid = c.from_user.id
     data = c.data or ""
     u = get_user(uid)
-
+# alle NICHT-Subs-Callbacks hierhin routen
+@bot.callback_query_handler(func=lambda c: not (c.data or "").startswith(("subs_", "admin_subs")))
+def on_cb_router(c: CallbackQuery):
+    on_cb_part2(c)
+    
     # --- Abo-Menü ---
     if data == "subs_menu":
         bot.answer_callback_query(c.id)
@@ -1847,17 +1851,23 @@ def on_cb_part2(c: CallbackQuery):
         WAITING_SOURCE_WALLET[uid] = True
         return
 
-    # withdraw
-    if data == "withdraw":
-        if not u["payout_wallet"]:
-            WAITING_PAYOUT_WALLET[uid] = True
-            bot.answer_callback_query(c.id, "Bitte Payout-Adresse senden.")
-            bot.send_message(uid, "🔑 Sende deine Auszahlungsadresse (SOL):"); return
-        WAITING_WITHDRAW_AMOUNT[uid] = None
-        bot.answer_callback_query(c.id, "Bitte Betrag eingeben.")
-        bot.send_message(uid, f"💳 Payout: `{md_escape(u['payout_wallet'])}`\nGib den Betrag in SOL ein (z. B. `0.25`).", parse_mode="Markdown")
+    # # withdraw
+if data == "withdraw":
+    if not u["payout_wallet"]:
         WAITING_PAYOUT_WALLET[uid] = True
+        bot.answer_callback_query(c.id, "Bitte Payout-Adresse senden.")
+        bot.send_message(uid, "🔑 Sende deine Auszahlungsadresse (SOL):")
         return
+    # Wallet existiert bereits → jetzt Betrag abfragen, NICHT auf Wallet warten
+    WAITING_PAYOUT_WALLET[uid] = False
+    WAITING_WITHDRAW_AMOUNT[uid] = None
+    bot.answer_callback_query(c.id, "Bitte Betrag eingeben.")
+    bot.send_message(
+        uid,
+        f"💳 Payout: `{md_escape(u['payout_wallet'])}`\nGib den Betrag in SOL ein (z. B. `0.25`).",
+        parse_mode="Markdown"
+    )
+    return
 
     if data.startswith("payoutopt_"):
         urow = get_user(uid)
