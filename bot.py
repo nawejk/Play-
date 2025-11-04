@@ -671,7 +671,14 @@ def kb_user_plans():
     kb.add(InlineKeyboardButton("💎 Diamond (einmalig)", callback_data="subs_choose_DIAMOND"))
     kb.add(InlineKeyboardButton("⬅️ Zurück", callback_data="subs_menu"))
     return kb
-
+    
+def kb_referral_menu():
+    kb = InlineKeyboardMarkup()
+    kb.add(InlineKeyboardButton("📊 Meine Ref-Stats", callback_data="ref_stats"),
+           InlineKeyboardButton("👥 Meine Ref-User", callback_data="ref_users"))
+    kb.add(InlineKeyboardButton("⬅️ Zurück", callback_data="back_home"))
+    return kb
+    
 def kb_subs_buy(plan_code: str):
     kb = InlineKeyboardMarkup()
     kb.add(InlineKeyboardButton("📨 Ich habe gesendet", callback_data=f"subs_sent_{plan_code}"))
@@ -725,7 +732,18 @@ def kb_withdraw_options_for(uid: int):
         kb.add(InlineKeyboardButton(label, callback_data=f"payoutopt_{days}"))
     kb.add(InlineKeyboardButton("↩️ Abbrechen", callback_data="back_home"))
     return kb
-
+def kb_auto_menu(u):
+    kb = InlineKeyboardMarkup()
+    state = (u["auto_mode"] or "OFF").upper()
+    togg = "OFF" if state == "ON" else "ON"
+    kb.add(InlineKeyboardButton(f"🤖 Auto {state} • umschalten → {togg}", callback_data="auto_toggle"))
+    kb.add(
+        InlineKeyboardButton("Risiko LOW", callback_data="auto_risk_LOW"),
+        InlineKeyboardButton("Risiko MEDIUM", callback_data="auto_risk_MEDIUM"),
+    )
+    kb.add(InlineKeyboardButton("Risiko HIGH", callback_data="auto_risk_HIGH"))
+    kb.add(InlineKeyboardButton("⬅️ Zurück", callback_data="back_home"))
+    return kb
 # ---------------------------
 # States (Abo)
 # ---------------------------
@@ -1319,7 +1337,151 @@ def on_cb_subs(c: CallbackQuery):
         bot.answer_callback_query(c.id, "Ablauf setzen")
         bot.send_message(uid, "Sende: `UID <id> <tage>` (setzt Ablauf ab jetzt)", parse_mode="Markdown")
         return
+    # Auto-Entry Menü
+    if data == "auto_menu":
+        bot.answer_callback_query(c.id)
+        u = get_user(uid)
+        bot.send_message(uid,
+            f"🤖 Auto-Entry\nStatus: {(u['auto_mode'] or 'OFF').upper()} • Risiko: {(u['auto_risk'] or 'MEDIUM').upper()}",
+            reply_markup=kb_auto_menu(u))
+        return
 
+    if data == "auto_toggle":
+        u = get_user(uid)
+        cur = (u["auto_mode"] or "OFF").upper()
+        new = "OFF" if cur == "ON" else "ON"
+        set_auto_mode(uid, new)
+        bot.answer_callback_query(c.id, f"Auto ist jetzt {new}")
+        u = get_user(uid)
+        bot.edit_message_text(
+            f"🤖 Auto-Entry\nStatus: {new} • Risiko: {(u['auto_risk'] or 'MEDIUM').upper()}",
+            c.message.chat.id, c.message.message_id, reply_markup=kb_auto_menu(u)
+        )
+        return
+
+    if data.startswith("auto_risk_"):
+        risk = data.split("_", 2)[2].upper()
+        if risk not in ("LOW", "MEDIUM", "HIGH"):
+            bot.answer_callback_query(c.id, "Ungültig."); return
+        set_auto_risk(uid, risk)
+        bot.answer_callback_query(c.id, f"Risiko = {risk}")
+        u = get_user(uid)
+        bot.edit_message_text(
+            f"🤖 Auto-Entry\nStatus: {(u['auto_mode'] or 'OFF').upper()} • Risiko: {risk}",
+            c.message.chat.id, c.message.message_id, reply_markup=kb_auto_menu(u)
+        )
+        return
+
+    # Portfolio
+    if data == "my_portfolio":
+        total_dep = sum_user_deposits(uid)
+        with get_db() as con:
+            row = con.execute("""
+                SELECT COALESCE(SUM(amount_lamports),0) AS s
+                FROM payouts
+                WHERE user_id=? AND status IN ('REQUESTED','APPROVED')
+            """, (uid,)).fetchone()
+        open_payouts = int(row["s"] or 0)
+        bal = get_balance_lamports(uid)
+        plan = get_active_plan(uid) or "—"
+        txt = (
+            "📈 *Dein Portfolio*\n\n"
+            f"🏦 Guthaben: {fmt_sol_usdc(bal)}\n"
+            f"💶 Einzahlungen (Summe): {fmt_sol_usdc(total_dep)}\n"
+            f"📤 Offene Auszahlungen: {fmt_sol_usdc(open_payouts)}\n"
+            f"💎 Aktives Abo: {plan}"
+        )
+        bot.answer_callback_query(c.id)
+        bot.send_message(uid, txt, parse_mode="Markdown", reply_markup=kb_main(get_user(uid)))
+        return
+        
+            if data == "admin_stats":
+        if not is_admin(uid): bot.answer_callback_query(c.id, "Nicht erlaubt."); return
+        users = count_users()
+        subs = len(all_subscribers())
+        dep = sum_total_deposits()
+        bal = sum_total_balances()
+        out = sum_open_payouts()
+        txt = (
+            "📊 *System-Stats*\n\n"
+            f"👥 Nutzer gesamt: {users}\n"
+            f"💎 Aktive Abos: {subs}\n"
+            f"💶 Summe Einzahlungen: {fmt_sol_usdc(dep)}\n"
+            f"🏦 Summe Guthaben (alle): {fmt_sol_usdc(bal)}\n"
+            f"📤 Offene Auszahlungen: {fmt_sol_usdc(out)}"
+        )
+        bot.answer_callback_query(c.id)
+        bot.send_message(uid, txt, parse_mode="Markdown")
+        return
+
+    if data == "admin_open_payouts":
+        if not is_admin(uid): bot.answer_callback_query(c.id, "Nicht erlaubt."); return
+        with get_db() as con:
+            rows = con.execute("""
+                SELECT id, user_id, amount_lamports, lockup_days, fee_percent, created_at
+                FROM payouts WHERE status='REQUESTED'
+                ORDER BY created_at ASC
+                LIMIT 30
+            """).fetchall()
+        bot.answer_callback_query(c.id)
+        if not rows:
+            bot.send_message(uid, "Keine offenen Auszahlungen."); return
+        for r in rows:
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("✅ Genehmigen", callback_data=f"payout_APPROVE_{r['id']}"),
+                   InlineKeyboardButton("📤 Gesendet", callback_data=f"payout_SENT_{r['id']}"),
+                   InlineKeyboardButton("❌ Ablehnen", callback_data=f"payout_REJECT_{r['id']}"))
+            bot.send_message(uid,
+                f"🧾 Auszahlung #{r['id']} • UID {r['user_id']}\n"
+                f"Betrag: {fmt_sol_usdc(int(r['amount_lamports'] or 0))}\n"
+                f"Lockup: {int(r['lockup_days'] or 0)}d • Fee: {float(r['fee_percent'] or 0):.2f}%\n"
+                f"Erstellt: {r['created_at']}",
+                reply_markup=kb)
+        return
+        
+            if data == "admin_stats":
+        if not is_admin(uid): bot.answer_callback_query(c.id, "Nicht erlaubt."); return
+        users = count_users()
+        subs = len(all_subscribers())
+        dep = sum_total_deposits()
+        bal = sum_total_balances()
+        out = sum_open_payouts()
+        txt = (
+            "📊 *System-Stats*\n\n"
+            f"👥 Nutzer gesamt: {users}\n"
+            f"💎 Aktive Abos: {subs}\n"
+            f"💶 Summe Einzahlungen: {fmt_sol_usdc(dep)}\n"
+            f"🏦 Summe Guthaben (alle): {fmt_sol_usdc(bal)}\n"
+            f"📤 Offene Auszahlungen: {fmt_sol_usdc(out)}"
+        )
+        bot.answer_callback_query(c.id)
+        bot.send_message(uid, txt, parse_mode="Markdown")
+        return
+
+    if data == "admin_open_payouts":
+        if not is_admin(uid): bot.answer_callback_query(c.id, "Nicht erlaubt."); return
+        with get_db() as con:
+            rows = con.execute("""
+                SELECT id, user_id, amount_lamports, lockup_days, fee_percent, created_at
+                FROM payouts WHERE status='REQUESTED'
+                ORDER BY created_at ASC
+                LIMIT 30
+            """).fetchall()
+        bot.answer_callback_query(c.id)
+        if not rows:
+            bot.send_message(uid, "Keine offenen Auszahlungen."); return
+        for r in rows:
+            kb = InlineKeyboardMarkup()
+            kb.add(InlineKeyboardButton("✅ Genehmigen", callback_data=f"payout_APPROVE_{r['id']}"),
+                   InlineKeyboardButton("📤 Gesendet", callback_data=f"payout_SENT_{r['id']}"),
+                   InlineKeyboardButton("❌ Ablehnen", callback_data=f"payout_REJECT_{r['id']}"))
+            bot.send_message(uid,
+                f"🧾 Auszahlung #{r['id']} • UID {r['user_id']}\n"
+                f"Betrag: {fmt_sol_usdc(int(r['amount_lamports'] or 0))}\n"
+                f"Lockup: {int(r['lockup_days'] or 0)}d • Fee: {float(r['fee_percent'] or 0):.2f}%\n"
+                f"Erstellt: {r['created_at']}",
+                reply_markup=kb)
+        return
 
 # alle NICHT-Subs-Callbacks hierhin routen
 @bot.callback_query_handler(func=lambda c: not (c.data or "").startswith(("subs_", "admin_subs")))
@@ -1913,13 +2075,46 @@ def on_cb_part2(c: CallbackQuery):
             parts.append(f"• {r['created_at']} • {r['kind']} • {fmt_sol_usdc(int(r['amount_lamports'] or 0))} • {r['meta'] or ''}")
         bot.send_message(uid, "\n".join(parts)); return
 
-    # referral
-    if data == "referral":
+        if data == "referral":
         code = _ensure_user_refcode(uid)
         bot_username = get_bot_username()
         link_md = _linkify_ref(bot_username, code)
         bot.answer_callback_query(c.id, "Referral")
-        bot.send_message(uid, f"Teile deinen Link:\n{link_md}", parse_mode="Markdown", disable_web_page_preview=True); return
+        bot.send_message(
+            uid,
+            f"🔗 *Dein Referral-Link*\n{link_md}\n\n"
+            "Nutze die Buttons unten für Auswertungen.",
+            parse_mode="Markdown",
+            disable_web_page_preview=True,
+            reply_markup=kb_referral_menu()
+        )
+        return
+        
+            if data == "ref_stats":
+        bot.answer_callback_query(c.id)
+        bot.send_message(uid, _ref_stats_text(uid), parse_mode="Markdown")
+        return
+
+    if data == "ref_users":
+        with get_db() as con:
+            rows = con.execute("""
+                SELECT u.user_id, u.username, r.deposit_total_lamports
+                FROM referrals r
+                JOIN users u ON u.user_id = r.invited_user_id
+                WHERE r.referrer_user_id=? AND r.level=1
+                ORDER BY r.deposit_total_lamports DESC, u.user_id ASC
+                LIMIT 100
+            """, (uid,)).fetchall()
+        bot.answer_callback_query(c.id)
+        if not rows:
+            bot.send_message(uid, "👥 Noch keine direkten (Level 1) Referrals.")
+            return
+        parts = ["👥 *Deine direkten Ref-User (Top 100)*\n(inkl. Summe ihrer Einzahlungen)"]
+        for i, r in enumerate(rows, 1):
+            name = ("@" + (r["username"] or "")) if r["username"] else f"UID {r['user_id']}"
+            parts.append(f"{i:>2}. {name} • {fmt_sol_usdc(int(r['deposit_total_lamports'] or 0))}")
+        bot.send_message(uid, "\n".join(parts), parse_mode="Markdown")
+        return
 
     # admin payout manage
     if data.startswith("payout_"):
