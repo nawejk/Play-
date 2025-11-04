@@ -8,7 +8,7 @@ import threading
 import sqlite3
 import hashlib
 import re
-from contextmanager import contextmanager
+from contextlib import contextmanager
 from typing import Optional, Dict, List, Tuple
 
 import requests
