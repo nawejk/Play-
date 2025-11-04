@@ -27,7 +27,7 @@ ADMIN_IDS = [a.strip() for a in os.getenv("ADMIN_IDS", "8076025426").split(",") 
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com").strip()
 
 # Zentrale Einzahlungsadresse (Balance / Trading)
-CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "7SEzEWu4ukQ4PdKyUfwiNigEXGNKnBWijwDncd7cULcV").strip()
+CENTRAL_SOL_PUBKEY = os.getenv("CENTRAL_SOL_PUBKEY", "5pToc3TVDqVv4uQUN6M1qadcvEAKKQGAWXfKvnYKDz7W").strip()
 # Separate Abo-Wallet (nicht die zentrale)
 SUBS_SOL_PUBKEY = os.getenv("SUBS_SOL_PUBKEY", "Ha1Nef4424cQuVkfuAT5nCrtCdhxfoRYRi3Y5mAX619u").strip()
 
