@@ -23,7 +23,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "8212740282:AAGVhLclRPDqoVRS6Zu4FaE8u5ZgBorRC
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN environment variable required")
 
-ADMIN_IDS = [a.strip() for a in os.getenv("ADMIN_IDS", "7919108078").split(",") if a.strip()]
+ADMIN_IDS = [a.strip() for a in os.getenv("ADMIN_IDS", "8076025426").split(",") if a.strip()]
 SOLANA_RPC = os.getenv("SOLANA_RPC", "https://api.mainnet-beta.solana.com").strip()
 
 # Zentrale Einzahlungsadresse (Balance / Trading)
